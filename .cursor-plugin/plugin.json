@@ -1,0 +1,30 @@
+{
+  "name": "cursor-cult",
+  "displayName": "Cursor Cult",
+  "version": "0.1.0",
+  "description": "A task-adaptive Cursor team that fans work across specialist subagents, preserves a single-writer invariant, and independently reviews and verifies the result.",
+  "author": {
+    "name": "ehzawad"
+  },
+  "homepage": "https://github.com/ehzawad/cursor-cult",
+  "repository": "https://github.com/ehzawad/cursor-cult",
+  "license": "MIT",
+  "keywords": [
+    "cursor",
+    "agents",
+    "subagents",
+    "multi-agent",
+    "orchestration",
+    "review",
+    "verification"
+  ],
+  "category": "developer-tools",
+  "tags": [
+    "agents",
+    "developer-tools",
+    "orchestration",
+    "quality"
+  ],
+  "skills": "./skills/",
+  "agents": "./agents/"
+}
