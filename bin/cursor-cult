@@ -1,0 +1,10 @@
+#!/usr/bin/env sh
+set -eu
+SELF=$0
+while [ -L "$SELF" ]; do
+  DIR=$(CDPATH= cd -P -- "$(dirname "$SELF")" && pwd)
+  LINK=$(readlink "$SELF")
+  case "$LINK" in /*) SELF=$LINK ;; *) SELF=$DIR/$LINK ;; esac
+done
+ROOT=$(CDPATH= cd -P -- "$(dirname "$SELF")/.." && pwd)
+exec python3 "$ROOT/scripts/cursor_cult.py" "$@"

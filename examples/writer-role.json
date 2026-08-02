@@ -1,0 +1,8 @@
+[
+  {
+    "id": "reconciled-local-change",
+    "label": "Reconciled local change",
+    "instruction": "Implement only the host-reconciled decision, preserve unrelated work, run the required checks, and stop when the Intent Capsule's acceptance evidence is satisfied or blocked.",
+    "mode": "agent"
+  }
+]
