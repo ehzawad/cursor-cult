@@ -31,7 +31,7 @@
     "cult": "tsx src/cli.ts"
   },
   "dependencies": {
-    "@cursor/sdk": "^1.0.24"
+    "@cursor/sdk": "1.0.24"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
