@@ -1,7 +1,3 @@
-node_modules/
-dist/
-.env
+__pycache__/
+*.pyc
 .cursor-cult/
-*.log
-.DS_Store
-coverage/
