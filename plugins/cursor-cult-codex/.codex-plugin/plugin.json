@@ -1,0 +1,20 @@
+{
+  "name": "cursor-cult",
+  "version": "0.3.0",
+  "description": "Codex conducts dynamically synthesized browser-authenticated Cursor CLI worker fleets.",
+  "author": {"name": "ehzawad"},
+  "homepage": "https://github.com/ehzawad/cursor-cult",
+  "repository": "https://github.com/ehzawad/cursor-cult",
+  "license": "MIT",
+  "keywords": ["cursor", "codex", "agents", "dynamic-roles", "orchestration"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Cursor Cult",
+    "shortDescription": "Conduct dynamic Cursor CLI worker fleets",
+    "developerName": "ehzawad",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "websiteURL": "https://github.com/ehzawad/cursor-cult",
+    "defaultPrompt": ["Use Cursor Cult to investigate this task with dynamically synthesized roles"]
+  }
+}

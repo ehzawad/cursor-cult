@@ -1,0 +1,16 @@
+{
+  "name": "cursor-cult",
+  "interface": {"displayName": "Cursor Cult"},
+  "plugins": [
+    {
+      "name": "cursor-cult",
+      "source": {"source": "local", "path": "./plugins/cursor-cult-codex"},
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE",
+        "products": ["CODEX"]
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

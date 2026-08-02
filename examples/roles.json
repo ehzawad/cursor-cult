@@ -1,0 +1,14 @@
+[
+  {
+    "id": "current-invariant-audit",
+    "label": "Current invariant audit",
+    "instruction": "Derive the invariants required by the user's current objective and test them against the live implementation and evidence.",
+    "mode": "ask"
+  },
+  {
+    "id": "highest-leverage-unknown",
+    "label": "Highest-leverage unknown",
+    "instruction": "Investigate the one evidence gap most likely to overturn the current direction. Cite concrete repository or command evidence.",
+    "mode": "ask"
+  }
+]

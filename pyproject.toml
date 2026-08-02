@@ -1,5 +1,8 @@
 [project]
 name = "cursor-cult"
-version = "0.2.0"
-description = "Adaptive Cursor CLI worker fleet for Codex and Claude Code"
-requires-python = ">=3.11"
+version = "0.3.0"
+description = "Dynamic host-orchestrated Cursor CLI worker fleets for Codex and Claude Code"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "ehzawad"}]
+keywords = ["cursor", "codex", "claude-code", "agents", "orchestration", "cli"]

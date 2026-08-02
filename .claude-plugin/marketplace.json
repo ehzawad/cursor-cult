@@ -1,1 +1,14 @@
-{"name":"cursor-cult","owner":{"name":"ehzawad"},"plugins":[{"name":"cursor-cult","source":"./plugins/cursor-cult","description":"Adaptive Cursor CLI worker fleet hosted by Claude Code."}]}
+{
+  "name": "cursor-cult",
+  "owner": {"name": "ehzawad"},
+  "metadata": {
+    "description": "Dynamic Cursor CLI worker fleets conducted by Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "cursor-cult",
+      "source": "./plugins/cursor-cult",
+      "description": "Claude Code synthesizes task-specific roles and conducts browser-authenticated Cursor CLI workers."
+    }
+  ]
+}

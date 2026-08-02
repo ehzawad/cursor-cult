@@ -2,11 +2,10 @@
   "name": "cursor-cult",
   "displayName": "Cursor Cult",
   "version": "0.3.0",
-  "description": "Claude Code conducts dynamically synthesized browser-authenticated Cursor CLI worker fleets.",
+  "description": "Dynamic, context-driven Cursor CLI worker fleets for Claude Code and Codex.",
   "author": {"name": "ehzawad"},
   "homepage": "https://github.com/ehzawad/cursor-cult",
   "repository": "https://github.com/ehzawad/cursor-cult",
   "license": "MIT",
-  "keywords": ["cursor", "claude-code", "agents", "dynamic-roles", "orchestration"],
-  "skills": "./skills/"
+  "keywords": ["cursor", "claude-code", "codex", "agents", "dynamic-roles", "orchestration"]
 }
