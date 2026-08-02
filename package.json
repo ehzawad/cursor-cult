@@ -1,0 +1,41 @@
+{
+  "name": "cursor-cult",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A native Cursor plugin and SDK runner for phased multi-role engineering work.",
+  "type": "module",
+  "packageManager": "pnpm@10.9.0",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "bin": {
+    "cursor-cult": "./dist/cli.js"
+  },
+  "files": [
+    ".cursor-plugin/",
+    "agents/",
+    "dist/",
+    "scripts/",
+    "skills/",
+    "CHANGELOG.md",
+    "DESIGN.md",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "check": "pnpm typecheck && pnpm test && pnpm build",
+    "cult": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@cursor/sdk": "1.0.24"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  }
+}
