@@ -23,8 +23,14 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DONE_SENTINEL = "CURSOR_CULT_DONE"
+# asyncio.StreamReader.readline() defaults to a 64KiB limit and raises
+# LimitOverrunError on a longer line instead of returning a partial one.
+# cursor-agent's stream-json transport can emit a single NDJSON line (e.g. a
+# large final "result" event) well past that -- one such role used to crash
+# the entire fleet. 32MiB comfortably covers any realistic single event.
+STREAM_LINE_LIMIT = 1 << 25
 ROLE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 TERMINAL_RUN_STATUSES = {"succeeded", "partial", "failed", "cancelled"}
 STALE_SESSION_PATTERNS = (
@@ -617,6 +623,7 @@ async def execute_attempt(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            limit=STREAM_LINE_LIMIT,
         )
     except OSError as exc:
         return RoleResult(
@@ -818,6 +825,45 @@ def render_json(results: Sequence[RoleResult]) -> str:
     ) + "\n"
 
 
+def load_partial_results(role_log_dir: Path, roles: Sequence[Role]) -> list[RoleResult]:
+    """Reconstruct whatever role results made it to disk before a crash.
+
+    Each role's result is persisted to role_log_dir/<id>.result.json the
+    instant it finishes (see execute_fleet.run_one), independent of whether
+    the overall fleet run completes normally. A role with no such file never
+    got to finish -- report it as failed rather than silently dropping it,
+    so the reconciled output still accounts for every requested role.
+    """
+    results: list[RoleResult] = []
+    for role in roles:
+        result_path = role_log_dir / f"{role.id}.result.json"
+        payload: dict[str, Any] | None = None
+        if result_path.exists():
+            with contextlib.suppress(json.JSONDecodeError, OSError, UnicodeDecodeError):
+                loaded = json.loads(result_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    payload = loaded
+        if payload is None:
+            results.append(
+                RoleResult(role=role, ok=False, error="fleet crashed before this role finished")
+            )
+            continue
+        results.append(
+            RoleResult(
+                role=role,
+                ok=bool(payload.get("ok")),
+                text=str(payload.get("text") or ""),
+                error=payload.get("error"),
+                session_id=payload.get("session_id"),
+                auth_source=payload.get("auth_source"),
+                exit_code=payload.get("exit_code"),
+                resumed=bool(payload.get("resumed")),
+                duration_ms=int(payload.get("duration_ms") or 0),
+            )
+        )
+    return results
+
+
 async def execute_fleet(
     *,
     roles: Sequence[Role],
@@ -834,8 +880,12 @@ async def execute_fleet(
     progress: Callable[[str, RoleResult | None], None] | None = None,
     registry: ActiveProcessRegistry | None = None,
 ) -> list[RoleResult]:
-    if max_parallel < 1:
-        raise UsageError("--max-parallel must be positive")
+    if max_parallel < 0:
+        raise UsageError("--max-parallel must not be negative")
+    # 0 (the default) means uncapped: every requested role runs concurrently.
+    # No artificial ceiling is imposed by this tool -- a fleet of 20 roles runs
+    # all 20 at once unless the caller explicitly opts into throttling.
+    effective_max_parallel = max_parallel if max_parallel > 0 else max(len(roles), 1)
     role_ids = {role.id for role in roles}
     unknown = writer_ids - role_ids
     if unknown:
@@ -848,25 +898,36 @@ async def execute_fleet(
     if role_log_dir is not None:
         role_log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     registry = registry or ActiveProcessRegistry()
-    semaphore = asyncio.Semaphore(max_parallel)
+    semaphore = asyncio.Semaphore(effective_max_parallel)
 
     async def run_one(role: Role) -> RoleResult:
         if progress:
             progress(role.id, None)
-        result = await execute_role(
-            cli=cli,
-            root=root,
-            role=role,
-            context=context,
-            allow_edit=role.id in writer_ids,
-            resume=resume,
-            session_key=session_key,
-            capabilities=capabilities,
-            require_login_auth=require_login_auth,
-            semaphore=semaphore,
-            registry=registry,
-            role_log_dir=role_log_dir,
-        )
+        try:
+            result = await execute_role(
+                cli=cli,
+                root=root,
+                role=role,
+                context=context,
+                allow_edit=role.id in writer_ids,
+                resume=resume,
+                session_key=session_key,
+                capabilities=capabilities,
+                require_login_auth=require_login_auth,
+                semaphore=semaphore,
+                registry=registry,
+                role_log_dir=role_log_dir,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - one role's crash must not sink the fleet
+            result = RoleResult(role=role, ok=False, error=f"role crashed: {exc!r}")
+        if role_log_dir is not None:
+            # Persist the instant this role finishes, not just at the very end:
+            # if a *different* role crashes the whole gather (or the process is
+            # killed) before the final report is rendered, completed work is
+            # still recoverable from role_log_dir instead of lost outright.
+            atomic_write_json(role_log_dir / f"{role.id}.result.json", result.to_dict())
         if progress:
             progress(role.id, result)
         return result
@@ -1079,7 +1140,9 @@ def add_execution_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-parallel",
         type=int,
-        default=int(os.environ.get("CURSOR_CULT_MAX_PARALLEL", "6")),
+        default=int(os.environ.get("CURSOR_CULT_MAX_PARALLEL", "0")),
+        help="cap on concurrent roles; 0 (default) means uncapped -- every "
+        "requested role runs at once. Set positive to deliberately throttle.",
     )
     parser.add_argument("--writer", action="append", default=[])
     parser.add_argument("--no-resume", action="store_true")
@@ -1139,6 +1202,15 @@ async def command_run(ns: argparse.Namespace) -> int:
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, task.cancel if task else lambda: None)
+
+    # Foreground runs persist per-role results as they land, the same way a
+    # detached `start` run already does -- so a crash (or a kill -9) loses at
+    # most the in-flight roles, never the ones that already finished.
+    run_dir = runs_root() / new_run_id()
+    role_log_dir = run_dir / "roles"
+    role_log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    print(f"role logs and results persisting to: {run_dir}", file=sys.stderr)
+
     try:
         results = await execute_fleet(
             roles=roles,
@@ -1152,14 +1224,26 @@ async def command_run(ns: argparse.Namespace) -> int:
             capabilities=capabilities,
             require_login_auth=not ns.allow_non_login_auth,
             registry=registry,
+            role_log_dir=role_log_dir,
         )
     except asyncio.CancelledError:
         await registry.terminate_all()
         return 130
+    except Exception as exc:  # noqa: BLE001 - never lose already-finished roles to a late crash
+        atomic_write_text(run_dir / "runner-error.log", f"{type(exc).__name__}: {exc}\n", mode=0o644)
+        partial = load_partial_results(role_log_dir, roles)
+        output = render_json(partial) if ns.format == "json" else render_markdown(partial)
+        if ns.output:
+            atomic_write_text(Path(ns.output), output, mode=0o644)
+        sys.stdout.write(output)
+        print(f"cursor-cult crashed ({exc}); partial results above, full logs in {run_dir}", file=sys.stderr)
+        return 1
 
     output = render_json(results) if ns.format == "json" else render_markdown(results)
     if ns.output:
         atomic_write_text(Path(ns.output), output, mode=0o644)
+    atomic_write_text(run_dir / "report.md", render_markdown(results), mode=0o644)
+    atomic_write_text(run_dir / "report.json", render_json(results), mode=0o644)
     sys.stdout.write(output)
     print(DONE_SENTINEL, file=sys.stderr)
     return exit_code_for_status(result_summary(results))

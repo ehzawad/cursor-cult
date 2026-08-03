@@ -1,7 +1,7 @@
 {
   "name": "cursor-cult",
   "displayName": "Cursor Cult",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Dynamic, context-driven Cursor CLI worker fleets for Claude Code and Codex.",
   "author": {"name": "ehzawad"},
   "homepage": "https://github.com/ehzawad/cursor-cult",

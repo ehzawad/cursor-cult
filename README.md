@@ -253,9 +253,9 @@ This keeps two Claude/Codex sessions in the same repository from accidentally sh
 ## Runner guarantees
 
 - No role catalog and no panel-size ceiling.
-- Bounded active concurrency; default `6`, configurable with `CURSOR_CULT_MAX_PARALLEL`.
+- No wall-clock timeout on a role's work, and no artificial concurrency cap: every requested role runs at once by default. Set `--max-parallel`/`CURSOR_CULT_MAX_PARALLEL` positive to deliberately throttle.
 - One Cursor process per role.
-- Successful sibling handoffs survive another role's failure.
+- Successful sibling handoffs survive another role's failure -- including a role that crashes the process outright (e.g. a stream exceeding the read-buffer limit): its sibling results are still reported, and every role's result is persisted to the run directory the instant it finishes, so a crash or a kill loses at most the still-in-flight roles.
 - Cursor terminal `result` is authoritative; exit code `0` without a non-empty terminal result is failure.
 - Unknown stream fields are ignored for forward compatibility.
 - Browser-login authentication is verified before launch.

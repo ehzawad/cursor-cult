@@ -1,6 +1,6 @@
 [project]
 name = "cursor-cult"
-version = "0.3.0"
+version = "0.4.0"
 description = "Dynamic host-orchestrated Cursor CLI worker fleets for Codex and Claude Code"
 requires-python = ">=3.10"
 license = {text = "MIT"}

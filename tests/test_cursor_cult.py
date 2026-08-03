@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -235,6 +236,67 @@ class CursorCultIntegrationTests(unittest.TestCase):
         self.assertIn("Fleet status: **partial**", result.stdout)
         self.assertIn("handoff role=good", result.stdout)
         self.assertIn("forced failure for bad", result.stdout)
+
+    def test_oversized_stream_line_does_not_crash_the_fleet(self) -> None:
+        # Regression: a single stream-json line past asyncio's default 64KiB
+        # readline() limit used to raise LimitOverrunError and take the whole
+        # fleet down with it -- including this sibling's already-good result.
+        self.fixture.write_roles(
+            [
+                {"id": "huge-lens", "label": "Huge", "instruction": "Return a huge line"},
+                {"id": "good", "label": "Good", "instruction": "Succeed"},
+            ]
+        )
+        result = self.run_cli(
+            *self.fixture.command("run"),
+            env=self.fixture.env(FAKE_CURSOR_HUGE_LINE_ROLES="huge-lens"),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Fleet status: **succeeded**", result.stdout)
+        self.assertIn("handoff role=good", result.stdout)
+        # Proves the line was read intact (not truncated/dropped) past the old limit.
+        self.assertIn("END_OF_HUGE_LINE", result.stdout)
+
+    def test_run_persists_role_results_for_recovery(self) -> None:
+        self.fixture.write_roles([{"id": "good", "label": "Good", "instruction": "Succeed"}])
+        result = self.run_cli(*self.fixture.command("run"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        match = re.search(r"role logs and results persisting to: (\S+)", result.stderr)
+        self.assertIsNotNone(match, result.stderr)
+        run_dir = Path(match.group(1))
+        payload = json.loads((run_dir / "roles" / "good.result.json").read_text())
+        self.assertTrue(payload["ok"])
+        self.assertIn("handoff role=good", payload["text"])
+        self.assertTrue((run_dir / "report.md").exists())
+        self.assertTrue((run_dir / "report.json").exists())
+
+    def test_max_parallel_defaults_to_uncapped(self) -> None:
+        roles = [{"id": f"sleepy-{i}", "label": f"Sleepy {i}", "instruction": "Inspect"} for i in range(8)]
+        self.fixture.write_roles(roles)
+        role_ids = ",".join(r["id"] for r in roles)
+        started = time.monotonic()
+        result = self.run_cli(
+            *self.fixture.command("run"),
+            env=self.fixture.env(FAKE_CURSOR_SLEEP_ROLES=role_ids, FAKE_CURSOR_SLEEP_SECS="1"),
+            timeout=30,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 1.8, "roles did not run concurrently -- max-parallel default regressed")
+
+    def test_max_parallel_explicit_throttle_still_works(self) -> None:
+        roles = [{"id": f"throttled-{i}", "label": f"T{i}", "instruction": "Inspect"} for i in range(4)]
+        self.fixture.write_roles(roles)
+        role_ids = ",".join(r["id"] for r in roles)
+        started = time.monotonic()
+        result = self.run_cli(
+            *self.fixture.command("run", "--max-parallel", "2"),
+            env=self.fixture.env(FAKE_CURSOR_SLEEP_ROLES=role_ids, FAKE_CURSOR_SLEEP_SECS="1"),
+            timeout=30,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreaterEqual(elapsed, 1.8, "explicit --max-parallel throttle was not honored")
 
     def test_empty_or_missing_terminal_result_is_failure(self) -> None:
         self.fixture.write_roles([{"id": "empty", "label": "Empty", "instruction": "Return empty"}])

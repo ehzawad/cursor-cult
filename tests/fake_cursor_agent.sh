@@ -67,5 +67,10 @@ if contains_role "${FAKE_CURSOR_EMPTY_RESULT_ROLES:-}" "$role"; then
   printf '{"type":"result","subtype":"success","is_error":false,"result":""}\n'
   exit 0
 fi
+if contains_role "${FAKE_CURSOR_HUGE_LINE_ROLES:-}" "$role"; then
+  pad=$(head -c "${FAKE_CURSOR_HUGE_LINE_BYTES:-100000}" /dev/zero | tr '\0' 'x')
+  printf '{"type":"result","subtype":"success","is_error":false,"result":"handoff role=%s pad=%s END_OF_HUGE_LINE"}\n' "$role" "$pad"
+  exit 0
+fi
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}\n'
 printf '{"type":"result","subtype":"success","is_error":false,"result":"handoff role=%s force=%s"}\n' "$role" "$force"
