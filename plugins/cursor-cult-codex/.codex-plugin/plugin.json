@@ -1,6 +1,6 @@
 {
   "name": "cursor-cult",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Codex conducts dynamically synthesized browser-authenticated Cursor CLI worker fleets.",
   "author": {"name": "ehzawad"},
   "homepage": "https://github.com/ehzawad/cursor-cult",

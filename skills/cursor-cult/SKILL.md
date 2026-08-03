@@ -104,7 +104,9 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/cursor_cult.py" run \
   > "$RUN/out.md" 2> "$RUN/err.log"
 ```
 
-Add exactly one `--writer <role-id>` only when authorized. Do not impose an outer wall-clock timeout. Read both outputs; normal stderr ends with `CURSOR_CULT_DONE`.
+Add exactly one `--writer <role-id>` only when authorized. Do not impose an outer wall-clock timeout — the runner itself has none, and no fleet size or role count is refused. `--max-parallel` defaults to uncapped (every requested role runs concurrently); pass it explicitly only to deliberately throttle. Read both outputs; normal stderr ends with `CURSOR_CULT_DONE`.
+
+The host's OWN foreground tool call may still enforce its own timeout independent of this script (e.g. Claude Code's Bash tool caps a blocking call regardless of what this skill does). That is a host limit, not a fleet limit: launch the `run` invocation through the host's background/async execution primitive (Claude Code: `run_in_background: true` on the Bash call) whenever the fleet is more than a handful of roles or any role's work could plausibly run long, rather than blocking foreground and hoping it finishes in time. This is safe by design — `run` persists each role's result to its run directory (path printed on the first stderr line) the instant that role finishes, so a host-side cutoff, a kill, or a crash loses at most the still-in-flight roles, never the ones already done; reconcile from what is on disk rather than treating a truncated wait as a failed fleet.
 
 Only when the user explicitly requests detached/background execution, use `start`, return the durable run ID, and explain `status`, `tail`, `wait`, `collect`, and `cancel`. Do not present launch as completion.
 

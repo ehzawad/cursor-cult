@@ -111,7 +111,9 @@ python3 "$SKILL_ROOT/scripts/cursor_cult.py" run \
   > "$RUN/out.md" 2> "$RUN/err.log"
 ```
 
-Add exactly one `--writer <role-id>` only when that role is authorized to edit this worktree. Do not impose an outer wall-clock timeout. Read both outputs; normal stderr ends with `CURSOR_CULT_DONE`.
+Add exactly one `--writer <role-id>` only when that role is authorized to edit this worktree. Do not impose an outer wall-clock timeout — the runner itself has none, and no fleet size or role count is refused. `--max-parallel` defaults to uncapped (every requested role runs concurrently); pass it explicitly only to deliberately throttle. Read both outputs; normal stderr ends with `CURSOR_CULT_DONE`.
+
+The host's OWN foreground call may still enforce its own timeout independent of this script. That is a host limit, not a fleet limit: for a fleet of more than a handful of roles, or any role whose work could plausibly run long, background the `run` invocation yourself (e.g. `... > "$RUN/out.md" 2> "$RUN/err.log" &`, tracking the PID, and poll/wait on it) rather than blocking foreground and hoping it finishes before the host cuts it off. This is safe by design — `run` persists each role's result to its run directory (path printed on the first stderr line) the instant that role finishes, so a cutoff, a kill, or a crash loses at most the still-in-flight roles, never the ones already done; reconcile from what is on disk rather than treating a truncated wait as a failed fleet.
 
 Only when the user explicitly asks for detached/background execution, use `start` instead of `run`, return the durable run ID, and explain `status`, `tail`, `wait`, `collect`, and `cancel`. Starting a run is not completing the task.
 
