@@ -1,3 +1,5 @@
 # Host integration
 
-Use foreground `run` normally. Use `start` only for an explicit background request; a run ID means launched, not complete. `${CLAUDE_SKILL_DIR}` locates the packaged runtime and `${CLAUDE_SESSION_ID}` scopes persistent role threads.
+Normal skill invocations use foreground `run`: the host waits, reconciles, and may dynamically compose a follow-up round. Use `start` only when the user explicitly requests detached/background execution. A returned run ID means launched, not completed; inspect with `status`, `tail`, `wait`, `collect`, and `cancel`.
+
+Codex installs the standalone skill under `${CODEX_HOME:-$HOME/.codex}/skills/cursor-cult` or uses the packaged Codex plugin, which requires `codex plugin add` after `codex plugin marketplace add`. Claude Code installs `cursor-cult@cursor-cult`; `${CLAUDE_SKILL_DIR}` locates the bundled runner and `${CLAUDE_SESSION_ID}` scopes persistent role threads.

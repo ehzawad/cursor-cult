@@ -47,6 +47,15 @@ Concrete paths, commands, observed outputs, risks, and unknowns.
 Inspect the current fixture repository.
 """
 
+FULL_CAPS = M.CursorCapabilities(
+    supports_mode=True,
+    supports_resume=True,
+    supports_model=True,
+    supports_force=True,
+    supports_trust=True,
+    supports_approve_mcps=True,
+)
+
 
 class Fixture:
     def __init__(self) -> None:
@@ -186,6 +195,57 @@ class CursorCultUnitTests(unittest.TestCase):
         two = M.role_state_path(root, "claude:two", "same-role")
         self.assertNotEqual(one, two)
 
+    def test_headless_gates_are_pre_answered(self) -> None:
+        role = M.Role("reader", "Reader", "Investigate", "ask")
+        args = M.build_cursor_args("cursor-agent", role, "prompt", None, False, FULL_CAPS)
+        self.assertIn("--trust", args)
+        self.assertIn("--approve-mcps", args)
+        self.assertIn("--force", args)
+
+    def test_agent_mode_is_never_passed_as_a_mode_value(self) -> None:
+        writer = M.Role("writer", "Writer", "Implement", "agent")
+        args = M.build_cursor_args("cursor-agent", writer, "prompt", None, True, FULL_CAPS)
+        self.assertNotIn("--mode", args)
+        reader = M.Role("reader", "Reader", "Investigate", "ask")
+        args = M.build_cursor_args("cursor-agent", reader, "prompt", None, False, FULL_CAPS)
+        self.assertEqual(args[args.index("--mode") + 1], "ask")
+
+    def test_agent_mode_requires_writer_authorization(self) -> None:
+        import asyncio
+
+        async def fan_out() -> None:
+            await M.execute_fleet(
+                roles=[M.Role("sneaky", "Sneaky", "Implement", "agent")],
+                context=CAPSULE,
+                root=Path.cwd(),
+                cli="cursor-agent",
+                writer_ids=set(),
+                max_parallel=0,
+                resume=False,
+                session_key="test:agent-mode",
+                capabilities=FULL_CAPS,
+                require_login_auth=True,
+            )
+
+        with self.assertRaises(M.UsageError):
+            asyncio.run(fan_out())
+
+    def test_writer_must_declare_agent_mode(self) -> None:
+        # A writer left in the default read-only mode cannot edit; fail loudly
+        # instead of running an appointed writer that silently changes nothing.
+        roles = [M.Role("builder", "Builder", "Implement")]
+        with self.assertRaises(M.UsageError):
+            M.validate_write_authority(roles, {"builder"})
+        M.validate_write_authority([M.Role("builder", "Builder", "Implement", "agent")], {"builder"})
+
+    def test_packaged_copies_match_their_sources(self) -> None:
+        check = subprocess.run(
+            [str(ROOT / "scripts" / "sync_packages.sh"), "--check"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(check.returncode, 0, check.stderr)
+
 
 class CursorCultIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -217,8 +277,10 @@ class CursorCultIntegrationTests(unittest.TestCase):
         self.assertIn("handoff role=first-lens", result.stdout)
         self.assertIn("handoff role=local-change force=1", result.stdout)
         trace = self.fixture.trace.read_text()
-        self.assertIn("first-lens|force=0", trace)
-        self.assertIn("local-change|force=1", trace)
+        # Commands are auto-approved for every role; read-only is enforced by --mode,
+        # and only the authorized writer runs in Cursor's default (agent) mode.
+        self.assertIn("first-lens|force=1|trust=1|mode=ask", trace)
+        self.assertIn("local-change|force=1|trust=1|mode=|", trace)
         self.assertIn(M.DONE_SENTINEL, result.stderr)
 
     def test_partial_failure_preserves_success(self) -> None:

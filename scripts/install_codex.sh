@@ -2,7 +2,8 @@
 set -eu
 MODE=link
 FORCE=0
-DEST=${AGENTS_HOME:-"$HOME/.agents"}/skills/cursor-cult
+# Codex discovers global user skills here only.
+DEST=${CODEX_HOME:-"$HOME/.codex"}/skills/cursor-cult
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --link) MODE=link ;;
@@ -15,16 +16,19 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+# Install the self-contained Codex skill tree, not the repository root.
+SKILL=$ROOT/codex-skills/cursor-cult
+[ -f "$SKILL/SKILL.md" ] || { echo "missing Codex skill tree: $SKILL" >&2; exit 1; }
 if [ -e "$DEST" ] || [ -L "$DEST" ]; then
   [ "$FORCE" -eq 1 ] || { echo "Codex skill exists: $DEST" >&2; exit 1; }
   rm -rf "$DEST"
 fi
 mkdir -p "$(dirname "$DEST")"
 if [ "$MODE" = link ]; then
-  ln -s "$ROOT" "$DEST"
+  ln -s "$SKILL" "$DEST"
 else
   mkdir -m 700 "$DEST"
-  cp "$ROOT/SKILL.md" "$ROOT/README.md" "$ROOT/DESIGN.md" "$ROOT/SECURITY.md" "$ROOT/LICENSE" "$DEST/"
-  cp -R "$ROOT/scripts" "$ROOT/skills" "$ROOT/examples" "$DEST/"
+  cp "$SKILL/SKILL.md" "$DEST/"
+  cp -R "$SKILL/scripts" "$SKILL/references" "$DEST/"
 fi
 printf 'Installed Cursor Cult Codex skill (%s): %s\n' "$MODE" "$DEST"

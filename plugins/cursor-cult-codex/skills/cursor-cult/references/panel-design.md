@@ -1,3 +1,3 @@
 # Dynamic panel design
 
-Synthesize role ownership from the current decision point. Do not use a persona catalog or mandatory phase graph. Honor user-selected lenses and recompose after every material round.
+Create the smallest useful set of task-specific role owners from current evidence and uncertainty. Never default to a fixed committee. Recompose after every material handoff or workspace change.

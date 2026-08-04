@@ -1,3 +1,7 @@
 # Dynamic panel design
 
-Roles are ephemeral ownership of current questions, not personas from a catalog. Honor user-selected lenses, use the smallest useful panel, recompose after every material round, and reuse an ID only for the same semantic lens. One shared worktree permits at most one writer.
+A role is ephemeral ownership of one current question or deliverable, not a persona selected from a catalog. Synthesize roles from the operative intent, live workspace, accumulated evidence, and remaining uncertainty.
+
+Honor user-selected lenses. Use the smallest useful panel; one role is valid. Avoid overlapping questions and ceremonial roles. Recompute the panel after every material handoff or workspace change. Reuse an ID only to continue the same semantic lens and Cursor conversation.
+
+Parallel writers require isolated worktrees and separate invocations. In one worktree, use at most one writer.

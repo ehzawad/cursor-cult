@@ -89,6 +89,27 @@ claude --plugin-dir /absolute/path/to/cursor-cult
 
 ## Summon from Codex
 
+Codex offers two independent install paths. Use one.
+
+### Codex plugin package
+
+The repository ships `.codex-plugin/plugin.json` and a marketplace entry at `.agents/plugins/marketplace.json` pointing to `./plugins/cursor-cult-codex`.
+
+Registering the marketplace only makes the plugin *available*; it does not install it. Both steps are required:
+
+```zsh
+codex plugin marketplace add ehzawad/cursor-cult
+codex plugin add cursor-cult@cursor-cult
+```
+
+Verify before restarting Codex:
+
+```zsh
+codex plugin list | grep cursor-cult
+```
+
+Expect `installed, enabled`. If it still reads `not installed`, the second command did not run and Codex will not surface the skill.
+
 ### Standalone user skill
 
 From a checkout of this repository:
@@ -97,30 +118,27 @@ From a checkout of this repository:
 ./scripts/install_codex.sh --link
 ```
 
-This links the self-contained skill to:
+This installs the self-contained `codex-skills/cursor-cult` tree to:
 
 ```text
-$HOME/.agents/skills/cursor-cult
+${CODEX_HOME:-$HOME/.codex}/skills/cursor-cult
 ```
 
-Restart Codex, then invoke:
+`${CODEX_HOME:-$HOME/.codex}/skills` is the global skill root Codex scans. Codex also reads a project-local `<repo>/.agents/skills`, but there is no `$HOME/.agents/skills` root — under your home directory, `.agents` holds plugin marketplace manifests, not skills. Pass `--dest` to install elsewhere, `--copy` to copy instead of symlink, and `--force` to replace an existing install.
+
+Verify, then restart Codex:
+
+```zsh
+ls "${CODEX_HOME:-$HOME/.codex}/skills/cursor-cult/SKILL.md"
+```
+
+Invoke it with your intent:
 
 ```text
 $cursor-cult trace this cache invalidation bug from the current branch and create only the roles that the evidence requires
 ```
 
-Codex can also select the skill implicitly when the task matches its description. Current Codex skill discovery supports repository `.agents/skills` locations and `$HOME/.agents/skills`.
-
-### Codex plugin package
-
-The repository includes `.codex-plugin/plugin.json` and a repo marketplace entry at `.agents/plugins/marketplace.json`. The manifest points to `./codex-skills/`.
-
-For local authoring/distribution, current Codex supports:
-
-```zsh
-codex plugin marketplace add ehzawad/cursor-cult
-codex plugin marketplace list
-```
+Codex can also select the skill implicitly when the task matches its description.
 
 ## The intent-preservation contract
 
@@ -172,13 +190,15 @@ After a round, the host reconciles the handoffs and inspects the actual workspac
 
 ## Writer model
 
-Read-only workers receive an explicit no-mutation contract. A single role can be appointed as writer:
+Read-only workers receive an explicit no-mutation contract. A single role can be appointed as writer, and that role must declare `"mode": "agent"`:
 
 ```zsh
 cursor-cult run ... --writer exact-role-id
 ```
 
-The writer receives Cursor's `--force` only when supported. The writer may mutate the local worktree within the Intent Capsule, but it may not commit, push, open or merge a PR, deploy, publish, or mutate external services unless the capsule explicitly authorizes that exact action.
+Write authority comes from Cursor's agent mode, not from `--force`. Workers are non-interactive, so `--trust`, `--approve-mcps`, and `--force` are passed to every role — an unanswered prompt would otherwise kill the worker before it produced anything. Those flags suppress prompts; they do not grant edit authority. The two directions are bound together and checked before launch: a role declaring `"mode": "agent"` without `--writer` is rejected, and a `--writer` role that is not in agent mode is rejected rather than running silently read-only.
+
+The writer may mutate the local worktree within the Intent Capsule, but it may not commit, push, open or merge a PR, deploy, publish, or mutate external services unless the capsule explicitly authorizes that exact action.
 
 Multiple writers are rejected in one invocation. Use isolated worktrees and separate fleets when parallel implementation is genuinely safe.
 

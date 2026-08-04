@@ -11,7 +11,7 @@ if [[ ${1:-} == "status" ]]; then
   exit 0
 fi
 if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
-  echo "cursor-agent -p --output-format stream-json --mode --model --resume --force"
+  echo "cursor-agent -p --output-format stream-json --mode --model --resume --force --trust --approve-mcps"
   exit 0
 fi
 if [[ ${1:-} == "--version" ]]; then
@@ -30,18 +30,22 @@ prompt=${!#}
 role=$(printf '%s\n' "$prompt" | sed -n 's/^ROLE ID: //p' | head -n1)
 [[ -n $role ]] || role=unknown
 force=0
+trust=0
+mode=""
 resume=""
 args=("$@")
 for ((i=0; i<${#args[@]}; i++)); do
   case ${args[$i]} in
     --force) force=1 ;;
+    --trust) trust=1 ;;
+    --mode) ((i+=1)); mode=${args[$i]:-} ;;
     --resume) ((i+=1)); resume=${args[$i]:-} ;;
     --resume=*) resume=${args[$i]#--resume=} ;;
   esac
 done
 
 if [[ -n ${FAKE_CURSOR_TRACE:-} ]]; then
-  printf '%s|force=%s|resume=%s\n' "$role" "$force" "$resume" >> "$FAKE_CURSOR_TRACE"
+  printf '%s|force=%s|trust=%s|mode=%s|resume=%s\n' "$role" "$force" "$trust" "$mode" "$resume" >> "$FAKE_CURSOR_TRACE"
 fi
 
 if contains_role "${FAKE_CURSOR_SLEEP_ROLES:-}" "$role"; then

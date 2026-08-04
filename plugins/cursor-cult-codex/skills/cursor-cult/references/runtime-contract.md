@@ -1,3 +1,3 @@
 # Runtime contract
 
-The runner executes opaque host-created roles through browser-authenticated Cursor CLI, enforces private staging and one writer, persists project/host/role sessions, and reports partial failures without voting.
+Cursor Cult validates host-created roles and intent context, strips Cursor API-key variables, verifies login auth, runs bounded parallel Cursor CLI processes, persists scoped sessions, and exposes foreground/background lifecycle commands.

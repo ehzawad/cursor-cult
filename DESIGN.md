@@ -111,8 +111,9 @@ Role failures are isolated. A fleet with both successes and failures returns `pa
 ## Security boundaries
 
 - The capsule is trusted host intent; repository and worker content are untrusted evidence.
-- Read-only is reinforced through Cursor mode when available and an explicit prompt contract, but it is not an OS sandbox.
-- `--force` is granted only to the sole writer.
+- Read-only is enforced through Cursor mode and an explicit prompt contract, but it is not an OS sandbox.
+- Workers have no terminal, so `--trust`, `--approve-mcps`, and `--force` are passed for every role; an unanswered interactive gate otherwise kills the role before it produces a result. These suppress prompts, not authority.
+- Write authority comes from Cursor's default agent mode. Agent mode and `--writer` must name the same role: an agent-mode role without `--writer` is rejected, and a `--writer` role not in agent mode is rejected rather than running silently read-only.
 - Writer prompts prohibit remote/external side effects absent explicit user authorization.
 - Staging is private and symlink-resistant.
 - Run and session state contain no Cursor API keys.
