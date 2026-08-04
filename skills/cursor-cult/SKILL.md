@@ -70,7 +70,7 @@ Write `roles.json` as a non-empty array of:
 }
 ```
 
-Use `ask` for investigation and `agent` only when agent capabilities are needed.
+Use `ask` for investigation. `agent` is write-capable and is rejected unless that same role is passed as `--writer`.
 
 ## 4. Preserve workspace safety
 

@@ -73,7 +73,7 @@ For each role, write an object in `roles.json`:
 }
 ```
 
-Use `mode: "ask"` for investigation. Use `mode: "agent"` only for a role that needs agent capabilities. The runner treats role IDs as opaque host-created identities; it contains no catalog.
+Use `mode: "ask"` for investigation. `mode: "agent"` is write-capable and is rejected unless that same role is passed as `--writer`. The runner treats role IDs as opaque host-created identities; it contains no catalog.
 
 ## 4. Preserve workspace safety
 

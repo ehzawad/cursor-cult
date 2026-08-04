@@ -12,7 +12,11 @@ The host writes an immutable Intent Capsule containing the verbatim request, aut
 
 ## Mutation
 
-Read-only workers receive a no-mutation contract and use Cursor Ask mode when available. This is not an operating-system sandbox. A writer is permitted only through explicit host selection; it receives `--force` and can execute commands without interactive approval. Use writers only in trusted, recoverable worktrees.
+Read-only workers receive a no-mutation contract and run in Cursor Ask mode. This is not an operating-system sandbox.
+
+Workers are non-interactive, so `--trust`, `--approve-mcps`, and `--force` are passed to every role: an unanswered workspace-trust, MCP, or command-approval prompt kills the worker before it produces a result. Every role can therefore execute commands without interactive approval, including read-only ones — treat any fleet invocation as running commands in that worktree.
+
+Edit authority is separate and comes from Cursor's agent mode, which is granted only to a role explicitly selected with `--writer`. Agent mode and `--writer` must agree, and a mismatch in either direction is rejected before launch. Use writers only in trusted, recoverable worktrees.
 
 Cursor Cult itself does not commit, push, merge, deploy, publish, or mutate external services. Those actions remain with the host and require explicit user authority.
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 — 2026-08-04
+
+- Fix Codex never surfacing the skill. `codex plugin marketplace add` only makes a plugin *available*; the README omitted the required `codex plugin add cursor-cult@cursor-cult`, so the plugin stayed `not installed` and its skill never loaded. Both steps are now documented with a verification command.
+- Fix `scripts/install_codex.sh` installing to `$HOME/.agents/skills/cursor-cult`, which Codex does not scan. It now installs to `${CODEX_HOME:-$HOME/.codex}/skills/cursor-cult`, the only global skill root Codex reads. The `AGENTS_HOME` and `~/.agents` fallbacks are removed.
+- Fix the installer packaging the repository root as the skill directory. `--link` and `--copy` now use the self-contained `codex-skills/cursor-cult` tree, so `references/` resolves and `.git`, tests, and examples are no longer exposed as skill content.
+- Fix every role failing in roughly 500ms with `Workspace Trust Required` in any directory the user had not interactively trusted. Workers have no terminal, so `--trust`, `--approve-mcps`, and `--force` are now passed for every role; an unanswered interactive gate killed the role before it produced a result.
+- Fix `mode: "agent"` being passed as `--mode agent`, which Cursor rejects — the documented writer path crashed on every invocation. Agent is Cursor's default mode and is now selected by omitting `--mode`.
+- Tie write authority to `--writer`: a role declaring `mode: "agent"` without being the authorized writer is now rejected before launch, since commands are auto-approved for every role.
+- Correct the false claim that Codex discovers skills under `$HOME/.agents/skills`; `~/.agents` holds plugin marketplace manifests, not skills.
+- Resync the packaged plugin skill trees, which had drifted from their sources, and add `scripts/sync_packages.sh --check` as a CI gate.
+- Remove the legacy bare-flag argv shim; subcommands are required.
+
 ## 0.4.0 — 2026-08-03
 
 - Fix a crash where one role emitting a single stream-json line past asyncio's default 64KiB `readline()` limit (`LimitOverrunError`) took down the entire fleet, discarding every other role's already-finished work. The subprocess stdout/stderr streams now use a 32MiB line limit.

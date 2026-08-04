@@ -23,13 +23,10 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 DONE_SENTINEL = "CURSOR_CULT_DONE"
-# asyncio.StreamReader.readline() defaults to a 64KiB limit and raises
-# LimitOverrunError on a longer line instead of returning a partial one.
-# cursor-agent's stream-json transport can emit a single NDJSON line (e.g. a
-# large final "result" event) well past that -- one such role used to crash
-# the entire fleet. 32MiB comfortably covers any realistic single event.
+# readline() raises LimitOverrunError past its 64KiB default; a large final
+# "result" event exceeds that and used to crash the fleet.
 STREAM_LINE_LIMIT = 1 << 25
 ROLE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 TERMINAL_RUN_STATUSES = {"succeeded", "partial", "failed", "cancelled"}
@@ -104,6 +101,8 @@ class CursorCapabilities:
     supports_resume: bool
     supports_model: bool
     supports_force: bool
+    supports_trust: bool
+    supports_approve_mcps: bool
 
 
 @dataclasses.dataclass
@@ -486,6 +485,8 @@ def run_cursor_probe(cli: str, cwd: Path) -> tuple[CursorCapabilities, str]:
         supports_resume="--resume" in help_text or not help_text,
         supports_model="--model" in help_text or not help_text,
         supports_force="--force" in help_text or not help_text,
+        supports_trust="--trust" in help_text or not help_text,
+        supports_approve_mcps="--approve-mcps" in help_text or not help_text,
     )
     return capabilities, status.stdout.strip()
 
@@ -533,16 +534,26 @@ def build_cursor_args(
     capabilities: CursorCapabilities,
 ) -> list[str]:
     args = [cli, "-p", "--output-format", "stream-json"]
-    if capabilities.supports_mode:
+    # A fleet worker has no terminal, so every interactive gate must be pre-answered:
+    # an unanswered workspace-trust, MCP-approval, or command-approval prompt exits 1
+    # with no result event. These bypass prompts, not the read-only contract — that is
+    # enforced by --mode below, which the Cursor agent honors independently of --force.
+    if capabilities.supports_trust:
+        args.append("--trust")
+    if capabilities.supports_approve_mcps:
+        args.append("--approve-mcps")
+    if capabilities.supports_force:
+        args.append("--force")
+    elif allow_edit:
+        raise UsageError("Cursor CLI does not advertise --force; cannot authorize a writer")
+    # `agent` is Cursor's default mode and is rejected as a --mode value; only the
+    # authorized writer runs there. Everyone else is pinned to a read-only mode.
+    if role.mode != "agent" and capabilities.supports_mode:
         args.extend(("--mode", role.mode))
     if role.model and capabilities.supports_model:
         args.extend(("--model", role.model))
     if session_id and capabilities.supports_resume:
         args.extend(("--resume", session_id))
-    if allow_edit:
-        if not capabilities.supports_force:
-            raise UsageError("Cursor CLI does not advertise --force; cannot authorize a writer")
-        args.append("--force")
     args.append(prompt)
     return args
 
@@ -864,6 +875,31 @@ def load_partial_results(role_log_dir: Path, roles: Sequence[Role]) -> list[Role
     return results
 
 
+def validate_write_authority(roles: Sequence[Role], writer_ids: set[str]) -> None:
+    """Reject any fleet whose write authority is ambiguous or unauthorized."""
+    unknown = writer_ids - {role.id for role in roles}
+    if unknown:
+        raise UsageError("unknown writer role(s): " + ", ".join(sorted(unknown)))
+    if len(writer_ids) > 1:
+        raise UsageError(
+            "one shared worktree permits one writer; run separate fleets in isolated worktrees"
+        )
+    # Commands are auto-approved for every role, so `agent` mode is the only thing
+    # standing between a role and the worktree. Bind the two directions together:
+    # unauthorized agent roles cannot write, and an authorized writer that forgot
+    # to declare `agent` fails loudly instead of running silently read-only.
+    unauthorized = sorted(r.id for r in roles if r.mode == "agent" and r.id not in writer_ids)
+    if unauthorized:
+        raise UsageError(
+            "role(s) declare mode 'agent' without --writer: " + ", ".join(unauthorized)
+        )
+    inert = sorted(r.id for r in roles if r.id in writer_ids and r.mode != "agent")
+    if inert:
+        raise UsageError(
+            "--writer role(s) must declare mode 'agent' to edit: " + ", ".join(inert)
+        )
+
+
 async def execute_fleet(
     *,
     roles: Sequence[Role],
@@ -883,17 +919,8 @@ async def execute_fleet(
     if max_parallel < 0:
         raise UsageError("--max-parallel must not be negative")
     # 0 (the default) means uncapped: every requested role runs concurrently.
-    # No artificial ceiling is imposed by this tool -- a fleet of 20 roles runs
-    # all 20 at once unless the caller explicitly opts into throttling.
     effective_max_parallel = max_parallel if max_parallel > 0 else max(len(roles), 1)
-    role_ids = {role.id for role in roles}
-    unknown = writer_ids - role_ids
-    if unknown:
-        raise UsageError("unknown writer role(s): " + ", ".join(sorted(unknown)))
-    if len(writer_ids) > 1:
-        raise UsageError(
-            "one shared worktree permits one writer; run separate fleets in isolated worktrees"
-        )
+    validate_write_authority(roles, writer_ids)
 
     if role_log_dir is not None:
         role_log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -923,10 +950,8 @@ async def execute_fleet(
         except Exception as exc:  # noqa: BLE001 - one role's crash must not sink the fleet
             result = RoleResult(role=role, ok=False, error=f"role crashed: {exc!r}")
         if role_log_dir is not None:
-            # Persist the instant this role finishes, not just at the very end:
-            # if a *different* role crashes the whole gather (or the process is
-            # killed) before the final report is rendered, completed work is
-            # still recoverable from role_log_dir instead of lost outright.
+            # Persist per role as it lands, so a sibling crash or a kill loses
+            # only the in-flight roles.
             atomic_write_json(role_log_dir / f"{role.id}.result.json", result.to_dict())
         if progress:
             progress(role.id, result)
@@ -1187,15 +1212,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def normalize_legacy_argv(argv: Sequence[str]) -> list[str]:
-    values = list(argv)
-    if values and values[0].startswith("--") and values[0] not in {"--version", "--help", "-h"}:
-        return ["run", *values]
-    return values
-
-
 async def command_run(ns: argparse.Namespace) -> int:
     roles, context, root, cli, capabilities, _ = prepare_invocation(ns)
+    # Validate before the crash-recovery region below, which would otherwise
+    # report an invalid invocation as a fleet failure instead of exit 2.
+    validate_write_authority(roles, set(ns.writer))
     registry = ActiveProcessRegistry()
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()
@@ -1203,9 +1224,7 @@ async def command_run(ns: argparse.Namespace) -> int:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, task.cancel if task else lambda: None)
 
-    # Foreground runs persist per-role results as they land, the same way a
-    # detached `start` run already does -- so a crash (or a kill -9) loses at
-    # most the in-flight roles, never the ones that already finished.
+    # Foreground runs persist per-role results as they land, like detached runs.
     run_dir = runs_root() / new_run_id()
     role_log_dir = run_dir / "roles"
     role_log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1252,11 +1271,7 @@ async def command_run(ns: argparse.Namespace) -> int:
 def command_check(ns: argparse.Namespace) -> int:
     roles, context, root, cli, capabilities, status_output = prepare_invocation(ns)
     writer_ids = set(ns.writer)
-    unknown = writer_ids - {role.id for role in roles}
-    if unknown:
-        raise UsageError("unknown writer role(s): " + ", ".join(sorted(unknown)))
-    if len(writer_ids) > 1:
-        raise UsageError("one shared worktree permits one writer")
+    validate_write_authority(roles, writer_ids)
     payload = {
         "ok": True,
         "version": VERSION,
@@ -1276,11 +1291,7 @@ def command_check(ns: argparse.Namespace) -> int:
 def command_start(ns: argparse.Namespace) -> int:
     roles, context, root, cli, capabilities, _ = prepare_invocation(ns)
     writer_ids = set(ns.writer)
-    unknown = writer_ids - {role.id for role in roles}
-    if unknown:
-        raise UsageError("unknown writer role(s): " + ", ".join(sorted(unknown)))
-    if len(writer_ids) > 1:
-        raise UsageError("one shared worktree permits one writer")
+    validate_write_authority(roles, writer_ids)
 
     run_id = new_run_id()
     run_dir = run_dir_for(run_id)
@@ -1468,7 +1479,7 @@ def command_cancel(ns: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = normalize_legacy_argv(sys.argv[1:] if argv is None else argv)
+    args = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     ns = parser.parse_args(args)
     try:
