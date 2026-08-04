@@ -26,7 +26,7 @@ if [ "$MODE" = link ]; then
   ln -s "$ROOT" "$PREFIX"
 else
   mkdir -m 700 "$PREFIX"
-  cp -R "$ROOT/bin" "$ROOT/scripts" "$ROOT/README.md" "$ROOT/DESIGN.md" "$ROOT/SECURITY.md" "$ROOT/LICENSE" "$PREFIX/"
+  cp -R "$ROOT/bin" "$ROOT/scripts" "$ROOT/.cursor" "$ROOT/README.md" "$ROOT/DESIGN.md" "$ROOT/SECURITY.md" "$ROOT/LICENSE" "$PREFIX/"
 fi
 TARGET="$BINDIR/cursor-cult"
 if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then

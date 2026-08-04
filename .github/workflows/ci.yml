@@ -17,11 +17,11 @@ jobs:
         with:
           python-version: "3.11"
       - name: Compile
-        run: python3 -m py_compile scripts/cursor_cult.py tests/test_cursor_cult.py
+        run: python3 -m py_compile scripts/cursor_cult.py scripts/cursor_delegate.py tests/*.py
       - name: Tests
         run: python3 -m unittest discover -s tests -v
       - name: Shell syntax
-        run: bash -n bin/cursor-cult scripts/*.sh tests/fake_cursor_agent.sh
+        run: bash -n bin/cursor-cult scripts/*.sh tests/*.sh
       - name: Packaging sync
         run: ./scripts/sync_packages.sh --check
       - name: Manifests
@@ -33,4 +33,6 @@ jobs:
           python3 -m json.tool plugins/cursor-cult/.claude-plugin/plugin.json >/dev/null
           python3 -m json.tool plugins/cursor-cult-codex/.codex-plugin/plugin.json >/dev/null
       - name: CLI smoke
-        run: ./bin/cursor-cult --version
+        run: |
+          ./bin/cursor-cult --version
+          ./bin/cursor-cult delegate --version
