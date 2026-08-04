@@ -339,12 +339,15 @@ class CursorCultIntegrationTests(unittest.TestCase):
         started = time.monotonic()
         result = self.run_cli(
             *self.fixture.command("run"),
-            env=self.fixture.env(FAKE_CURSOR_SLEEP_ROLES=role_ids, FAKE_CURSOR_SLEEP_SECS="1"),
-            timeout=30,
+            env=self.fixture.env(FAKE_CURSOR_SLEEP_ROLES=role_ids, FAKE_CURSOR_SLEEP_SECS="3"),
+            timeout=60,
         )
         elapsed = time.monotonic() - started
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertLess(elapsed, 1.8, "roles did not run concurrently -- max-parallel default regressed")
+        # One concurrent wave is ~3s; any reintroduced ceiling makes 8 roles take
+        # two waves (>=6s). The long sleep keeps process-spawn overhead on a busy
+        # CI runner well inside the margin.
+        self.assertLess(elapsed, 5.0, "roles did not run concurrently -- max-parallel default regressed")
 
     def test_max_parallel_explicit_throttle_still_works(self) -> None:
         roles = [{"id": f"throttled-{i}", "label": f"T{i}", "instruction": "Inspect"} for i in range(4)]
