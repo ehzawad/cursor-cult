@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 DONE_SENTINEL = "CURSOR_CULT_DONE"
 # readline() raises LimitOverrunError past its 64KiB default; a large final
 # "result" event exceeds that and used to crash the fleet.
@@ -51,6 +51,21 @@ SUPERVISOR_START_GRACE_SECONDS = 10
 # catch a run that completed just before the monitor attached, narrow enough that a
 # session-length monitor never re-announces the project's whole run archive.
 WATCH_ALL_REPLAY_GRACE_SECONDS = 120
+# Key prefixes that identify a genuinely distinct host session. The terminal-scoped
+# fallbacks and the literal "project" collide between concurrent sessions, so the
+# watcher singleton must not engage for them.
+SESSION_SCOPED_KEY_PREFIXES = frozenset(
+    {
+        "cursor_cult_session_key",
+        "claude_code_session_id",
+        "claude_code_remote_session_id",
+        "claude_session_id",
+        "codex_thread_id",
+    }
+)
+# Retention floor for `prune`. Never delete a run younger than this even if terminal:
+# a host may still be about to collect its report.
+PRUNE_MIN_AGE_SECONDS = 3600
 TERMINAL_EVENT_TYPES = {"run_completed", "run_failed", "run_cancelled"}
 INTENT_HEADINGS = (
     "# Intent Capsule",
@@ -202,6 +217,24 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+def fsync_dir(path: Path) -> None:
+    """Durably commit a directory entry. Never raises.
+
+    os.replace() is atomic but the *rename* is only durable once the containing
+    directory is fsynced. Without this a power loss could lose a state.json rename
+    while the separately-fsynced journal append survived, leaving the two disagreeing.
+    Best effort by design: every state, roles, config, and report write goes through
+    atomic_write_text, so a filesystem that cannot fsync a directory must not break
+    writing entirely.
+    """
+    with contextlib.suppress(OSError):
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 def atomic_write_text(path: Path, text: str, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -213,6 +246,7 @@ def atomic_write_text(path: Path, text: str, mode: int = 0o600) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
+        fsync_dir(path.parent)
     finally:
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
@@ -361,19 +395,29 @@ def state_root() -> Path:
     return base / "cursor-cult"
 
 
-def runs_root() -> Path:
-    """The run root, created 0700.
+def make_private_dir(path: Path) -> Path:
+    """mkdir -p with 0700 on every level, not just the leaf.
 
-    Individual run directories are already 0700, but `mkdir(parents=True, mode=...)`
-    applies its mode only to the leaf, so both parents were left at the umask default
-    of 0755 — letting any local user enumerate run IDs, project names, and timing.
+    `mkdir(parents=True, mode=...)` applies its mode only to the final component, so
+    intermediate directories are left at the umask default of 0755 — enough for any
+    local user to enumerate run IDs, project names, role names, and timing.
     """
-    root = state_root() / "runs"
-    for path in (root.parent, root):
-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with contextlib.suppress(OSError):
-            path.chmod(0o700)
-    return root
+    parts = list(path.parts)
+    for i in range(1, len(parts) + 1):
+        step = Path(*parts[:i])
+        if not step.exists():
+            with contextlib.suppress(OSError):
+                step.mkdir(mode=0o700)
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with contextlib.suppress(OSError):
+        path.chmod(0o700)
+    with contextlib.suppress(OSError):
+        path.parent.chmod(0o700)
+    return path
+
+
+def runs_root() -> Path:
+    return make_private_dir(state_root() / "runs")
 
 
 def derive_session_key(explicit: str | None) -> str:
@@ -409,6 +453,69 @@ def role_state_path(root: Path, session_key: str, role_id: str) -> Path:
     project_key = short_hash(str(root))
     session_hash = short_hash(session_key)
     return state_root() / "sessions" / f"{project_key}-{session_hash}__{role_id}.json"
+
+
+def role_config_dir(root: Path, session_key: str, role_id: str) -> Path:
+    """Per-role Cursor config directory, keyed exactly like role_state_path.
+
+    This MUST be stable across runs, not ephemeral. `CURSOR_CONFIG_DIR` relocates the
+    CLI's `chats/` store as well as its settings, so a fresh directory per run would
+    make every `--resume` fail with `Session "<id>" not found` — which
+    STALE_SESSION_PATTERNS does not match, so the role would hard-fail instead of
+    retrying fresh. Keying it identically to the role's session file means the chat
+    store travels with the session id that references it.
+    """
+    project_key = short_hash(str(root))
+    session_hash = short_hash(session_key)
+    return state_root() / "cfg" / f"{project_key}-{session_hash}__{role_id}"
+
+
+def write_role_cursor_config(
+    config_dir: Path, allow_edit: bool, allow_shell: bool
+) -> Path:
+    """Materialize a Cursor CLI config that enforces this role's authority.
+
+    Cursor resolves `permissions` from its config file and documents that "deny rules
+    take precedence over allow rules" — verified against the installed CLI, where a
+    denied write and a denied shell command were both refused in agent mode *with*
+    `--force`. This is the only containment in the system that does not depend on the
+    undocumented question of whether `--mode` outranks `--force`.
+
+    The operator's own config is inherited so model choice and editor preferences are
+    preserved, but `authInfo` is never copied: a redirected config dir still
+    authenticates, so duplicating credentials into run state would be pure risk.
+    """
+    # 0700 on every level. Cursor persists its own material here — a `chats/` store,
+    # caches, and its authentication record — because CURSOR_CONFIG_DIR redirects the
+    # whole config directory, not just the settings file. The directory mode is what
+    # protects that; Cursor rewrites the files under its own umask.
+    make_private_dir(config_dir)
+
+    base: dict[str, Any] = {}
+    source = Path.home() / ".cursor" / "cli-config.json"
+    with contextlib.suppress(OSError, json.JSONDecodeError):
+        loaded = json.loads(source.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            base = loaded
+    for secret in ("authInfo",):
+        base.pop(secret, None)
+    base["version"] = base.get("version", 1)
+
+    deny: list[str] = []
+    if not allow_edit:
+        deny.append("Write(**)")
+        if not allow_shell:
+            # Shell is a write vector: `>` redirection, sed -i, and rm all bypass a
+            # Write() deny. A role declared read-only is only genuinely read-only when
+            # both are closed. Cursor's own file-reading tools are unaffected.
+            deny.append("Shell(*)")
+    # Stop a worker rewriting the very file that constrains it. realpath matters: the
+    # resolver compares resolved paths, and on macOS $TMPDIR resolves through /private.
+    deny.append(f"Write({os.path.realpath(config_dir)}/**)")
+    base["permissions"] = {"allow": [], "deny": deny}
+
+    atomic_write_json(config_dir / "cli-config.json", base)
+    return config_dir
 
 
 def load_session(path: Path) -> str | None:
@@ -456,11 +563,17 @@ class AsyncFileLock:
             self.handle = None
 
 
-def sanitized_cursor_env() -> dict[str, str]:
+def sanitized_cursor_env(config_dir: Path | None = None) -> dict[str, str]:
     env = dict(os.environ)
     if env.get("CURSOR_CULT_KEEP_CURSOR_API_ENV") != "1":
         for key in API_ENV_KEYS:
             env.pop(key, None)
+    # Always drop an inherited CURSOR_CONFIG_DIR, unconditionally and separately from
+    # the API-key policy: an outer value would silently redirect a worker away from
+    # the permission config that constrains it.
+    env.pop("CURSOR_CONFIG_DIR", None)
+    if config_dir is not None:
+        env["CURSOR_CONFIG_DIR"] = str(config_dir)
     return env
 
 
@@ -670,6 +783,7 @@ async def execute_attempt(
     require_login_auth: bool,
     registry: ActiveProcessRegistry,
     role_log_dir: Path | None,
+    config_dir: Path | None = None,
 ) -> RoleResult:
     prompt = build_prompt(role, context, allow_edit)
     args = build_cursor_args(cli, role, prompt, session_id, allow_edit, capabilities)
@@ -682,7 +796,7 @@ async def execute_attempt(
         proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=root,
-            env=sanitized_cursor_env(),
+            env=sanitized_cursor_env(config_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
@@ -695,6 +809,7 @@ async def execute_attempt(
             error=f"failed to launch Cursor CLI: {exc}",
             duration_ms=int((time.monotonic() - started) * 1000),
         )
+    worker_note = record_worker(role_log_dir, role.id, proc.pid, cli)
 
     await registry.add(role.id, proc)
     try:
@@ -716,6 +831,10 @@ async def execute_attempt(
             raise
     finally:
         await registry.remove(role.id, proc)
+        # This worker can no longer be an orphan; drop its reap claim.
+        if worker_note is not None:
+            with contextlib.suppress(OSError):
+                worker_note.unlink()
 
     duration_ms = int((time.monotonic() - started) * 1000)
     diagnostics = stderr_text.strip()[-6000:]
@@ -794,10 +913,19 @@ async def execute_role(
     semaphore: asyncio.Semaphore,
     registry: ActiveProcessRegistry,
     role_log_dir: Path | None,
+    allow_readonly_shell: bool = False,
 ) -> RoleResult:
     async with semaphore:
         session_path = role_state_path(root, session_key, role.id)
         lock_path = session_path.with_suffix(".lock")
+        # Written under the same lock that serializes this role's session, and keyed
+        # identically, so the chat store and the session id that references it always
+        # travel together.
+        config_dir = write_role_cursor_config(
+            role_config_dir(root, session_key, role.id),
+            allow_edit=allow_edit,
+            allow_shell=allow_readonly_shell,
+        )
         async with AsyncFileLock(lock_path):
             stored_session = load_session(session_path) if resume else None
             result = await execute_attempt(
@@ -811,6 +939,7 @@ async def execute_role(
                 require_login_auth=require_login_auth,
                 registry=registry,
                 role_log_dir=role_log_dir,
+                config_dir=config_dir,
             )
             if (
                 stored_session
@@ -830,6 +959,7 @@ async def execute_role(
                     require_login_auth=require_login_auth,
                     registry=registry,
                     role_log_dir=role_log_dir,
+                    config_dir=config_dir,
                 )
             if result.ok and result.session_id:
                 save_session(session_path, result.session_id, role, session_key)
@@ -1020,6 +1150,7 @@ async def execute_fleet(
     session_key: str,
     capabilities: CursorCapabilities,
     require_login_auth: bool,
+    allow_readonly_shell: bool = False,
     role_log_dir: Path | None = None,
     progress: Callable[[str, RoleResult | None], None] | None = None,
     registry: ActiveProcessRegistry | None = None,
@@ -1053,6 +1184,7 @@ async def execute_fleet(
                 semaphore=semaphore,
                 registry=registry,
                 role_log_dir=role_log_dir,
+                allow_readonly_shell=allow_readonly_shell,
             )
         except asyncio.CancelledError:
             raise
@@ -1199,6 +1331,91 @@ def append_event_line(path: Path, event: dict[str, Any]) -> None:
         handle.write(json.dumps(event, sort_keys=True) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+    if not existed:
+        fsync_dir(path.parent)
+
+
+def journal_tail(path: Path, window: int = 65536) -> tuple[int, int]:
+    """Return (size, bytes_of_complete_records) for the journal.
+
+    A crash mid-append leaves a newline-less fragment at the tail. Reading a bounded
+    window from the end keeps this O(1) rather than O(journal) — this runs on every
+    terminal check.
+
+    (size, -1) means "unreadable": the caller must never treat that as authority to
+    truncate. Conflating it with "missing" would let a transient EACCES or EIO destroy
+    a perfectly good journal.
+    """
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return 0, 0
+    except OSError:
+        return 0, -1
+    if size == 0:
+        return 0, 0
+    try:
+        with path.open("rb") as handle:
+            span = window
+            while True:
+                handle.seek(max(0, size - span))
+                blob = handle.read()
+                cut = blob.rfind(b"\n")
+                if cut >= 0:
+                    return size, max(0, size - span) + cut + 1
+                if size - span <= 0:
+                    # No newline anywhere: the whole file is one torn fragment.
+                    return size, 0
+                span *= 2
+    except OSError:
+        return size, -1
+
+
+def repair_journal(run_dir: Path) -> int:
+    """Truncate a torn trailing record. Returns bytes removed.
+
+    Callers must hold .state.lock. A fragment left in place is worse than useless:
+    the next append concatenates onto it, producing one unparseable line where a
+    terminal record should have been — so `watch` exits having delivered no terminal
+    event at all. Truncating restores a well-formed journal; the lost record is
+    reconstructed by ensure_terminal_event.
+    """
+    path = run_dir / "events.ndjson"
+    size, complete = journal_tail(path)
+    if complete < 0 or size <= complete:
+        return 0
+    with contextlib.suppress(OSError):
+        with path.open("r+b") as handle:
+            handle.truncate(complete)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return size - complete
+    return 0
+
+
+def last_journal_sequence(run_dir: Path) -> int:
+    """Highest sequence actually present in the journal, or 0.
+
+    Read from the tail so this stays O(1) on a long-running fleet.
+    """
+    path = run_dir / "events.ndjson"
+    size, complete = journal_tail(path)
+    if complete <= 0:
+        return 0
+    try:
+        with path.open("rb") as handle:
+            handle.seek(max(0, complete - 65536))
+            blob = handle.read(complete - max(0, complete - 65536))
+    except OSError:
+        return 0
+    for line in reversed(blob.decode("utf-8", "replace").splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and isinstance(value.get("sequence"), int):
+            return value["sequence"]
+    return 0
 
 
 def last_persisted_run_event(run_dir: Path) -> dict[str, Any] | None:
@@ -1234,6 +1451,10 @@ def record_run_event(
                 if state_path.exists()
                 else {}
             )
+            # Drop any torn trailing record before reading the journal or appending to
+            # it, so a crash mid-append cannot make the next append concatenate onto a
+            # fragment and destroy both records.
+            repair_journal(run_dir)
             # Evaluate the suppression guards BEFORE mutating. Both depend only on the
             # persisted state and journal, and running mutate first meant a suppressed
             # event still applied the caller's mutation to `state` and returned it —
@@ -1259,7 +1480,11 @@ def record_run_event(
             # every role_completed message reading "status unknown".
             details = dict(details or {})
             now = utc_now()
-            sequence = int(state.get("event_sequence", 0)) + 1
+            # Take the high-water mark of state and journal. A crash between the state
+            # commit and the journal append leaves state ahead; power loss can leave
+            # the journal ahead. Either way the next sequence must exceed both, so a
+            # number already present in the journal is never reused.
+            sequence = max(int(state.get("event_sequence", 0)), last_journal_sequence(run_dir)) + 1
             state["event_sequence"] = sequence
             state["updated_at"] = now
             state["last_event_at"] = now
@@ -1312,11 +1537,19 @@ def reconcile_run_liveness(run_dir: Path) -> dict[str, Any]:
     pid = state.get("pid")
     reason: str | None = None
 
+    # Prefer the lock: it is released by the kernel however the supervisor died and is
+    # immune to PID reuse. Runs staged before lock ownership have no lock file, so
+    # those fall back to the PID heuristic.
     if status == "running":
-        if not isinstance(pid, int) or not process_is_alive(pid):
+        if not supervisor_is_alive(run_dir, pid if isinstance(pid, int) else None):
             reason = "supervisor process is no longer alive"
     elif status == "queued":
-        if isinstance(pid, int):
+        lock_state = supervisor_lock_state(run_dir)
+        if lock_state == "free":
+            reason = "queued supervisor exited before it started the fleet"
+        elif lock_state == "held":
+            reason = None
+        elif isinstance(pid, int):
             if not process_is_alive(pid):
                 reason = "queued supervisor process is no longer alive"
         else:
@@ -1364,11 +1597,18 @@ def reconcile_run_liveness(run_dir: Path) -> dict[str, Any]:
                 }:
                     role_state["status"] = "cancelled"
 
+        # Reap BEFORE announcing the terminal event, so a host that reacts to it is not
+        # told the run is over while an agent-mode writer is still editing the worktree.
+        # Runs once: the state transition below makes this branch unreachable next time.
+        reaped = reap_orphaned_workers(run_dir)
+        details: dict[str, Any] = {"reason": reason, **report_details(run_dir)}
+        if reaped:
+            details["reaped_workers"] = reaped
         state, _ = record_run_event(
             run_dir,
             terminal_event_for_status(outcome),
             fail,
-            {"reason": reason, **report_details(run_dir)},
+            details,
         )
     return state
 
@@ -1524,6 +1764,138 @@ def copy_background_inputs(
     record_run_event(run_dir, "run_queued")
 
 
+def open_owner_lock(run_dir: Path):
+    """Take the supervisor's liveness lock. Returns the open handle, or None.
+
+    The handle must stay open for the supervisor's whole life and be inherited by it,
+    because the kernel releases flock locks when the last descriptor closes — including
+    on SIGKILL, a crash, or a power-off reboot. That makes "is the supervisor alive?"
+    answerable without trusting a PID, which can be recycled.
+    """
+    make_private_dir(run_dir)
+    handle = (run_dir / "supervisor.lock").open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def supervisor_lock_state(run_dir: Path) -> str:
+    """'held', 'free', or 'absent' for this run's supervisor lock.
+
+    'absent' means the run predates lock-based ownership (or the file was removed), so
+    callers must fall back to the PID heuristic rather than assume the run is dead.
+    """
+    lock_path = run_dir / "supervisor.lock"
+    if not lock_path.exists():
+        return "absent"
+    try:
+        handle = lock_path.open("a+")
+    except OSError:
+        return "held"  # cannot prove it is free; assume alive rather than kill a run
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return "held"
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return "free"
+    finally:
+        handle.close()
+
+
+def supervisor_is_alive(run_dir: Path, pid: int | None) -> bool:
+    state = supervisor_lock_state(run_dir)
+    if state == "absent":
+        return process_is_alive(pid)
+    return state == "held"
+
+
+def claim_watcher_singleton(target_root: str, session_key: str):
+    """Claim the sole watcher slot for one (project, session), or return None.
+
+    A stale claim from a killed monitor needs no timeout or reclaim protocol: the lock
+    is an flock, so the kernel drops it when that process dies.
+    """
+    lock_dir = make_private_dir(state_root() / "watchers")
+    name = f"{short_hash(target_root)}-{short_hash(session_key)}.lock"
+    try:
+        handle = (lock_dir / name).open("a+")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def record_worker(role_log_dir: Path | None, role_id: str, pid: int, cli: str) -> Path | None:
+    """Note a live worker so a dead supervisor's orphans can be found and reaped."""
+    if role_log_dir is None:
+        return None
+    with contextlib.suppress(OSError):
+        make_private_dir(role_log_dir)
+        path = role_log_dir / f"{role_id}.worker.json"
+        atomic_write_json(path, {"pid": pid, "role_id": role_id, "cli": cli})
+        return path
+    return None
+
+
+def reap_orphaned_workers(run_dir: Path) -> list[int]:
+    """Kill workers left behind by a supervisor that died without cleaning up.
+
+    Verified by execution that both the fake CLI and a real cursor-agent outlive a
+    SIGKILLed supervisor, so without this an authorized agent-mode writer keeps editing
+    the worktree with nothing supervising it.
+
+    PID reuse is handled by identity, not by trust: `ps -ww -o command=` still shows the
+    full argv, which carries both the Cursor binary and the role id embedded in the
+    prompt. A recycled PID cannot match both. One `ps` call covers the whole fleet.
+    """
+    role_dir = run_dir / "roles"
+    if not role_dir.is_dir():
+        return []
+    claims: dict[int, dict[str, Any]] = {}
+    for path in role_dir.glob("*.worker.json"):
+        value = load_json(path) if path.exists() else None
+        if isinstance(value, dict) and isinstance(value.get("pid"), int):
+            claims[value["pid"]] = value
+    if not claims:
+        return []
+
+    listing = ""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        listing = subprocess.run(
+            ["ps", "-ww", "-o", "pid=,command=", "-p", ",".join(str(p) for p in claims)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10,
+        ).stdout
+
+    reaped: list[int] = []
+    for line in listing.splitlines():
+        head, _, command = line.strip().partition(" ")
+        if not head.isdigit():
+            continue
+        claim = claims.get(int(head))
+        if claim is None:
+            continue
+        # Both must match, or this PID belongs to something else entirely.
+        if str(claim.get("cli", "")) not in command:
+            continue
+        if f"ROLE ID: {claim.get('role_id')}" not in command:
+            continue
+        with contextlib.suppress(OSError):
+            os.killpg(os.getpgid(int(head)), signal.SIGKILL)
+            reaped.append(int(head))
+    for path in role_dir.glob("*.worker.json"):
+        with contextlib.suppress(OSError):
+            path.unlink()
+    return reaped
+
+
 def process_is_alive(pid: int | None) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
@@ -1634,6 +2006,7 @@ async def supervise_run(run_dir: Path) -> int:
             session_key=str(config["session_key"]),
             capabilities=capabilities,
             require_login_auth=bool(config["require_login_auth"]),
+            allow_readonly_shell=bool(config.get("allow_readonly_shell", False)),
             role_log_dir=run_dir / "roles",
             progress=progress,
             registry=registry,
@@ -1753,6 +2126,14 @@ def add_execution_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session-key")
     parser.add_argument("--allow-non-login-auth", action="store_true")
     parser.add_argument("--unsafe-staging", action="store_true")
+    parser.add_argument(
+        "--readonly-shell",
+        action="store_true",
+        help="let ask/plan roles run shell commands. They are denied by default "
+        "because shell is a write vector (redirection, sed -i, rm) that a "
+        "Write(**) deny does not cover; Cursor's own file-reading tools are "
+        "unaffected either way.",
+    )
 
 
 def default_heartbeat_seconds() -> float:
@@ -1823,6 +2204,19 @@ def build_parser() -> argparse.ArgumentParser:
     watch_all_parser.add_argument("--poll", type=float, default=0.5)
     watch_all_parser.add_argument("--format", choices=("jsonl", "text"), default="jsonl")
 
+    prune_parser = subparsers.add_parser(
+        "prune", help="delete finished run directories that nothing is still using"
+    )
+    prune_parser.add_argument("--cwd", default=".")
+    prune_parser.add_argument(
+        "--all-projects", action="store_true", help="prune every project, not just --cwd"
+    )
+    prune_parser.add_argument("--max-age-hours", type=float, default=24 * 7)
+    prune_parser.add_argument(
+        "--keep", type=int, default=20, help="always retain this many newest finished runs"
+    )
+    prune_parser.add_argument("--dry-run", action="store_true")
+
     for name in ("status", "wait", "collect", "tail", "cancel"):
         item = subparsers.add_parser(name)
         item.add_argument("run_id")
@@ -1872,6 +2266,7 @@ async def command_run(ns: argparse.Namespace) -> int:
             session_key=derive_session_key(ns.session_key),
             capabilities=capabilities,
             require_login_auth=not ns.allow_non_login_auth,
+            allow_readonly_shell=ns.readonly_shell,
             registry=registry,
             role_log_dir=role_log_dir,
         )
@@ -1946,11 +2341,16 @@ def command_start(ns: argparse.Namespace) -> int:
         "resume": not ns.no_resume,
         "session_key": derive_session_key(ns.session_key),
         "require_login_auth": not ns.allow_non_login_auth,
+        "allow_readonly_shell": bool(ns.readonly_shell),
         "heartbeat_seconds": float(ns.heartbeat_seconds),
         "warnings": [notice] if notice else [],
     }
     copy_background_inputs(run_dir, roles, context, config)
 
+    # Take the liveness lock BEFORE spawning and hand the descriptor to the supervisor,
+    # so the run is covered from the moment it is queued rather than only once the
+    # child publishes a PID. The kernel releases it however the supervisor dies.
+    owner_lock = open_owner_lock(run_dir)
     log_handle = (run_dir / "supervisor.log").open("ab", buffering=0)
     # Match the 0600 every other run artifact gets; this captures supervisor tracebacks
     # and Cursor stderr just like they do.
@@ -1964,9 +2364,12 @@ def command_start(ns: argparse.Namespace) -> int:
             stderr=subprocess.STDOUT,
             start_new_session=True,
             close_fds=True,
+            pass_fds=() if owner_lock is None else (owner_lock.fileno(),),
         )
     except OSError as exc:
         log_handle.close()
+        if owner_lock is not None:
+            owner_lock.close()
 
         def fail(state: dict[str, Any]) -> None:
             state.update(
@@ -1988,6 +2391,11 @@ def command_start(ns: argparse.Namespace) -> int:
     finally:
         with contextlib.suppress(Exception):
             log_handle.close()
+        # Release the parent's descriptor. The supervisor inherited its own, so the
+        # lock stays held by exactly the process whose life it is meant to track.
+        if owner_lock is not None:
+            with contextlib.suppress(Exception):
+                owner_lock.close()
 
     def record_pid(state: dict[str, Any]) -> None:
         if state.get("status") in {"queued", "running"}:
@@ -2121,22 +2529,51 @@ def command_watch_all(ns: argparse.Namespace) -> int:
         raise UsageError("--poll must be positive")
     target_root = str(project_root(Path(ns.cwd)))
     target_session = None if ns.all_sessions else derive_session_key(ns.session_key)
+
+    # One watcher per (project, session) — a second live monitor delivers every event
+    # twice into the model's context. Only claim the singleton when the session key is
+    # genuinely per-session: derive_session_key falls back to terminal-scoped values and
+    # to the literal "project", and under those a naive singleton would send session B's
+    # events to session A and leave B silent, which is worse than duplication.
+    singleton = None
+    session_is_scoped = bool(ns.session_key) or (
+        bool(target_session)
+        and target_session.split(":", 1)[0] in SESSION_SCOPED_KEY_PREFIXES
+    )
+    if target_session and session_is_scoped:
+        singleton = claim_watcher_singleton(target_root, target_session)
+        if singleton is None:
+            return 0  # another watcher already owns this session; exit quietly
+
     offsets: dict[Path, int] = {}
+    retired: set[Path] = set()
+    matches: dict[Path, bool] = {}
     started_at = dt.datetime.now(dt.timezone.utc)
 
     while True:
         root = runs_root()
         if root.exists():
             for run_dir in sorted(path for path in root.iterdir() if path.is_dir()):
-                try:
-                    config = load_json(run_dir / "config.json")
-                except (UsageError, OSError, ValueError):
+                if run_dir in retired:
                     continue
-                if not isinstance(config, dict):
-                    continue
-                if str(config.get("project_root")) != target_root:
-                    continue
-                if target_session and str(config.get("session_key")) != target_session:
+                if run_dir not in matches:
+                    try:
+                        config = load_json(run_dir / "config.json")
+                    except (UsageError, OSError, ValueError):
+                        continue
+                    if not isinstance(config, dict):
+                        # copy_background_inputs mkdirs before it writes config.json, so
+                        # a run seen inside that window is not yet classifiable. Cache
+                        # only positive results; a negative one would blackhole it.
+                        continue
+                    matches[run_dir] = (
+                        str(config.get("project_root")) == target_root
+                        and (
+                            not target_session
+                            or str(config.get("session_key")) == target_session
+                        )
+                    )
+                if not matches[run_dir]:
                     continue
 
                 # Reconcile only runs this watcher owns. Doing it before the filters
@@ -2158,26 +2595,97 @@ def command_watch_all(ns: argparse.Namespace) -> int:
                     # Anything that finished before that window is history. Replaying it
                     # meant every skill invocation re-announced the project's entire run
                     # archive into the live session (thousands of notifications, all of
-                    # them stale), and nothing ever prunes runs_root(). Start such runs
-                    # at EOF instead. Consumers still deduplicate on (run_id, sequence).
+                    # them stale). Start such runs at EOF instead. Consumers still
+                    # deduplicate on (run_id, sequence).
                     offsets[run_dir] = (
                         0
                         if is_recent_or_live(run_dir, started_at)
                         else journal_size(run_dir)
                     )
 
-                new_offset, _ = stream_new_events(
+                new_offset, terminal_seen = stream_new_events(
                     run_dir / "events.ndjson",
                     offsets[run_dir],
                     0,
                     ns.format,
                 )
                 offsets[run_dir] = new_offset
-        # Drop runs whose directories are gone so a session-length monitor's bookkeeping
-        # cannot grow without bound.
+                if terminal_seen:
+                    # Retire on the terminal RECORD, never on terminal status: state.json
+                    # is written before the journal line, so status would retire the run
+                    # a moment before its most important event exists.
+                    retired.add(run_dir)
+                    offsets.pop(run_dir, None)
         for gone in [path for path in offsets if not path.exists()]:
             offsets.pop(gone, None)
+        for gone in [path for path in matches if not path.exists()]:
+            matches.pop(gone, None)
+            retired.discard(gone)
         time.sleep(ns.poll)
+
+
+def prune_runs(
+    target_root: str | None, max_age_seconds: float, keep: int, dry_run: bool
+) -> list[str]:
+    """Delete finished run directories. Returns the run IDs removed (or that would be).
+
+    Three independent vetoes, because deleting a live run destroys evidence a host is
+    still waiting on: the run must be terminal, its supervisor lock must not be held,
+    and it must be older than PRUNE_MIN_AGE_SECONDS. `keep` retains the newest N
+    terminal runs regardless of age.
+    """
+    root = runs_root()
+    if not root.exists():
+        return []
+    now = dt.datetime.now(dt.timezone.utc)
+    floor = max(max_age_seconds, PRUNE_MIN_AGE_SECONDS)
+    candidates: list[tuple[dt.datetime, Path, str]] = []
+    for run_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+        config = load_json(run_dir / "config.json") if (run_dir / "config.json").exists() else None
+        if target_root is not None:
+            if not isinstance(config, dict) or str(config.get("project_root")) != target_root:
+                continue
+        try:
+            state = load_run_state(run_dir)
+        except (UsageError, OSError, ValueError):
+            continue
+        if state.get("status") not in TERMINAL_RUN_STATUSES:
+            continue
+        if supervisor_lock_state(run_dir) == "held":
+            continue
+        finished = parse_utc_timestamp(state.get("finished_at")) or parse_utc_timestamp(
+            state.get("updated_at")
+        )
+        if finished is None or (now - finished).total_seconds() < floor:
+            continue
+        candidates.append((finished, run_dir, str(state.get("run_id", run_dir.name))))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    doomed = candidates[keep:] if keep > 0 else candidates
+    removed: list[str] = []
+    for _, run_dir, run_id in doomed:
+        if dry_run:
+            removed.append(run_id)
+            continue
+        with contextlib.suppress(OSError):
+            shutil.rmtree(run_dir)
+            removed.append(run_id)
+    return removed
+
+
+def command_prune(ns: argparse.Namespace) -> int:
+    target_root = None if ns.all_projects else str(project_root(Path(ns.cwd)))
+    removed = prune_runs(
+        target_root,
+        max_age_seconds=float(ns.max_age_hours) * 3600.0,
+        keep=int(ns.keep),
+        dry_run=bool(ns.dry_run),
+    )
+    verb = "would remove" if ns.dry_run else "removed"
+    print(f"{verb} {len(removed)} run(s)")
+    for run_id in removed:
+        print(f"  {run_id}")
+    return 0
 
 
 def command_collect(ns: argparse.Namespace) -> int:
@@ -2253,6 +2761,13 @@ def command_cancel(ns: argparse.Namespace) -> int:
     # own run_cancelled, reconcile_run_liveness reads this and resolves the run to
     # cancelled/130 rather than misreporting an explicit cancellation as a failure.
     update_run_state(run_dir, lambda current: current.update({"cancel_requested": utc_now()}))
+    # Only signal a PID the lock still vouches for. A recycled PID would otherwise send
+    # SIGTERM to an unrelated process group.
+    if not supervisor_is_alive(run_dir, pid):
+        reap_orphaned_workers(run_dir)
+        ensure_terminal_event(run_dir, reconcile_run_liveness(run_dir))
+        print("cancelled")
+        return 130
     try:
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -2278,6 +2793,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return command_watch(ns)
         if ns.command == "watch-all":
             return command_watch_all(ns)
+        if ns.command == "prune":
+            return command_prune(ns)
         if ns.command == "wait":
             return command_wait(ns)
         if ns.command == "collect":
