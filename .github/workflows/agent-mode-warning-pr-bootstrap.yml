@@ -32,6 +32,12 @@ jobs:
           start = workflow.index(marker) + len(marker)
           end = workflow.index("\n          PY\n", start)
           patch = textwrap.dedent(workflow[start:end]) + "\n"
+          # Multiline Markdown literals inside the embedded Python retain the
+          # Python call's four-space indentation. Normalize only the README
+          # continuation lines that are column-zero in the actual document.
+          patch = patch.replace("\n    The writer may mutate'''", "\nThe writer may mutate'''")
+          patch = patch.replace("\n    Cursor accepts only", "\nCursor accepts only")
+          patch = patch.replace("\n    ```zsh'''", "\n```zsh'''")
           Path('/tmp/apply_agent_mode_patch.py').write_text(patch, encoding='utf-8')
           PY
           python3 /tmp/apply_agent_mode_patch.py
