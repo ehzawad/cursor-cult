@@ -1,0 +1,411 @@
+name: temporary agent-mode compatibility patch
+
+on:
+  push:
+    branches:
+      - agent/agent-mode-background-warning
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/agent-mode-background-warning
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Apply compatibility, warning, tests, and docs patch
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one anchor, found {count}: {old[:80]!r}")
+              file.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          runner = "scripts/cursor_cult.py"
+          replace_once(
+              runner,
+              'API_ENV_KEYS = ("CURSOR_API_KEY", "CURSOR_AGENT_API_KEY")\nINTENT_HEADINGS = (',
+              'API_ENV_KEYS = ("CURSOR_API_KEY", "CURSOR_AGENT_API_KEY")\n'
+              'AGENT_MODE_EXPLANATION = (\n'
+              '    "Cursor CLI agent mode is selected by omitting `--mode`; this CLI version "\n'
+              '    "accepts only `ask` and `plan` as explicit `--mode` values."\n'
+              ')\n'
+              'INTENT_HEADINGS = (',
+          )
+          replace_once(
+              runner,
+              '''    inert = sorted(r.id for r in roles if r.id in writer_ids and r.mode != "agent")
+              if inert:
+                  raise UsageError(
+                      "--writer role(s) must declare mode 'agent' to edit: " + ", ".join(inert)
+                  )
+
+
+          async def execute_fleet(''',
+              '''    inert = sorted(r.id for r in roles if r.id in writer_ids and r.mode != "agent")
+              if inert:
+                  raise UsageError(
+                      "--writer role(s) must declare mode 'agent' to edit: " + ", ".join(inert)
+                  )
+
+
+          def agent_mode_notice(
+              roles: Sequence[Role],
+              writer_ids: set[str],
+              *,
+              execution: str,
+          ) -> str | None:
+              agent_writers = [
+                  role for role in roles if role.id in writer_ids and role.mode == "agent"
+              ]
+              if not agent_writers:
+                  return None
+              names = ", ".join(f"{role.id} ({role.label})" for role in agent_writers)
+              return (
+                  f"WARNING: {execution} includes Cursor agent mode for writer role(s): {names}. "
+                  "Agent mode can edit files and run commands. "
+                  f"{AGENT_MODE_EXPLANATION}"
+              )
+
+
+          def emit_agent_mode_notice(
+              roles: Sequence[Role],
+              writer_ids: set[str],
+              *,
+              execution: str,
+          ) -> str | None:
+              notice = agent_mode_notice(roles, writer_ids, execution=execution)
+              if notice:
+                  print(notice, file=sys.stderr)
+              return notice
+
+
+          async def execute_fleet(''',
+          )
+          replace_once(
+              runner,
+              '''            "roles": [
+                          {"id": role.id, "label": role.label, "status": "queued"} for role in roles
+                      ],''',
+              '''            "warnings": list(config.get("warnings", [])),
+                      "roles": [
+                          {
+                              "id": role.id,
+                              "label": role.label,
+                              "mode": role.mode,
+                              "status": "queued",
+                          }
+                          for role in roles
+                      ],''',
+          )
+          replace_once(
+              runner,
+              '''    validate_write_authority(roles, set(ns.writer))
+              registry = ActiveProcessRegistry()''',
+              '''    writer_ids = set(ns.writer)
+              validate_write_authority(roles, writer_ids)
+              emit_agent_mode_notice(roles, writer_ids, execution="foreground run")
+              registry = ActiveProcessRegistry()''',
+          )
+          replace_once(runner, '            writer_ids=set(ns.writer),', '            writer_ids=writer_ids,')
+          replace_once(
+              runner,
+              '''    writer_ids = set(ns.writer)
+              validate_write_authority(roles, writer_ids)
+              payload = {''',
+              '''    writer_ids = set(ns.writer)
+              validate_write_authority(roles, writer_ids)
+              notice = agent_mode_notice(roles, writer_ids, execution="validated fleet")
+              payload = {''',
+          )
+          replace_once(
+              runner,
+              '''        "api_environment_stripped": list(API_ENV_KEYS),
+              }''',
+              '''        "api_environment_stripped": list(API_ENV_KEYS),
+                  "warnings": [notice] if notice else [],
+              }''',
+          )
+          replace_once(
+              runner,
+              '''    writer_ids = set(ns.writer)
+              validate_write_authority(roles, writer_ids)
+
+              run_id = new_run_id()''',
+              '''    writer_ids = set(ns.writer)
+              validate_write_authority(roles, writer_ids)
+              notice = emit_agent_mode_notice(
+                  roles,
+                  writer_ids,
+                  execution="detached/background run",
+              )
+
+              run_id = new_run_id()''',
+          )
+          replace_once(
+              runner,
+              '''        "require_login_auth": not ns.allow_non_login_auth,
+              }''',
+              '''        "require_login_auth": not ns.allow_non_login_auth,
+                  "warnings": [notice] if notice else [],
+              }''',
+          )
+          replace_once(
+              runner,
+              '''    else:
+                  print(f"{state.get('run_id', ns.run_id)}\\t{state.get('status', 'unknown')}")
+                  for role in state.get("roles", []):
+                      print(f"  {role.get('id')}\\t{role.get('status')}")''',
+              '''    else:
+                  print(f"{state.get('run_id', ns.run_id)}\\t{state.get('status', 'unknown')}")
+                  for warning in state.get("warnings", []):
+                      print(f"  {warning}")
+                  for role in state.get("roles", []):
+                      print(
+                          f"  {role.get('id')}\\t{role.get('status')}\\tmode={role.get('mode', 'unknown')}"
+                      )''',
+          )
+
+          tests = "tests/test_cursor_cult.py"
+          replace_once(
+              tests,
+              '''        reader = M.Role("reader", "Reader", "Investigate", "ask")
+                  args = M.build_cursor_args("cursor-agent", reader, "prompt", None, False, FULL_CAPS)
+                  self.assertEqual(args[args.index("--mode") + 1], "ask")''',
+              '''        reader = M.Role("reader", "Reader", "Investigate", "ask")
+                  args = M.build_cursor_args("cursor-agent", reader, "prompt", None, False, FULL_CAPS)
+                  self.assertEqual(args[args.index("--mode") + 1], "ask")
+                  planner = M.Role("planner", "Planner", "Plan", "plan")
+                  args = M.build_cursor_args("cursor-agent", planner, "prompt", None, False, FULL_CAPS)
+                  self.assertEqual(args[args.index("--mode") + 1], "plan")''',
+          )
+          replace_once(
+              tests,
+              '''    def test_agent_mode_requires_writer_authorization(self) -> None:
+                  import asyncio''',
+              '''    def test_agent_mode_notice_explains_risk_and_cli_compatibility(self) -> None:
+                  writer = M.Role("writer", "Writer", "Implement", "agent")
+                  notice = M.agent_mode_notice(
+                      [writer],
+                      {"writer"},
+                      execution="detached/background run",
+                  )
+                  self.assertIsNotNone(notice)
+                  assert notice is not None
+                  self.assertIn("can edit files and run commands", notice)
+                  self.assertIn("omitting `--mode`", notice)
+                  self.assertIn("only `ask` and `plan`", notice)
+                  self.assertIsNone(
+                      M.agent_mode_notice(
+                          [M.Role("reader", "Reader", "Inspect", "ask")],
+                          set(),
+                          execution="foreground run",
+                      )
+                  )
+
+              def test_agent_mode_requires_writer_authorization(self) -> None:
+                  import asyncio''',
+          )
+          replace_once(
+              tests,
+              '''        self.assertIn("local-change|force=1|trust=1|mode=|", trace)
+                  self.assertIn(M.DONE_SENTINEL, result.stderr)''',
+              '''        self.assertIn("local-change|force=1|trust=1|mode=|", trace)
+                  self.assertIn("WARNING: foreground run includes Cursor agent mode", result.stderr)
+                  self.assertIn("omitting `--mode`", result.stderr)
+                  self.assertIn(M.DONE_SENTINEL, result.stderr)''',
+          )
+          replace_once(
+              tests,
+              '''        self.assertEqual(payload["roles"][0]["id"], "odd-task-lens")
+                  self.assertEqual(set(payload["api_environment_stripped"]), {"CURSOR_API_KEY", "CURSOR_AGENT_API_KEY"})''',
+              '''        self.assertEqual(payload["roles"][0]["id"], "odd-task-lens")
+                  self.assertEqual(set(payload["api_environment_stripped"]), {"CURSOR_API_KEY", "CURSOR_AGENT_API_KEY"})
+                  self.assertEqual(payload["warnings"], [])''',
+          )
+          replace_once(
+              tests,
+              '''    def test_background_start_wait_collect(self) -> None:
+                  self.fixture.write_roles([{"id": "background-lens", "label": "Background", "instruction": "Inspect"}])
+                  started = self.run_cli(*self.fixture.command("start"))
+                  self.assertEqual(started.returncode, 0, started.stderr)
+                  run_id = started.stdout.strip()
+                  self.assertRegex(run_id, r"^\\d{8}T\\d{6}Z-[0-9a-f]{8}$")
+
+                  wait = self.run_cli(
+                      sys.executable,
+                      str(RUNNER),
+                      "wait",
+                      run_id,
+                      "--poll",
+                      "0.05",
+                      env=self.fixture.env(),
+                  )
+                  self.assertEqual(wait.returncode, 0, wait.stderr)
+                  self.assertIn("succeeded", wait.stdout)
+
+                  collected = self.run_cli(
+                      sys.executable,
+                      str(RUNNER),
+                      "collect",
+                      run_id,
+                      env=self.fixture.env(),
+                  )
+                  self.assertEqual(collected.returncode, 0)
+                  self.assertIn("handoff role=background-lens", collected.stdout)''',
+              '''    def test_background_start_wait_collect_with_mixed_modes(self) -> None:
+                  self.fixture.write_roles(
+                      [
+                          {
+                              "id": "background-ask",
+                              "label": "Background ask",
+                              "instruction": "Inspect",
+                              "mode": "ask",
+                          },
+                          {
+                              "id": "background-plan",
+                              "label": "Background plan",
+                              "instruction": "Plan",
+                              "mode": "plan",
+                          },
+                          {
+                              "id": "background-writer",
+                              "label": "Background writer",
+                              "instruction": "Implement",
+                              "mode": "agent",
+                          },
+                      ]
+                  )
+                  started = self.run_cli(
+                      *self.fixture.command("start", "--writer", "background-writer")
+                  )
+                  self.assertEqual(started.returncode, 0, started.stderr)
+                  self.assertIn(
+                      "WARNING: detached/background run includes Cursor agent mode",
+                      started.stderr,
+                  )
+                  self.assertIn("omitting `--mode`", started.stderr)
+                  run_id = started.stdout.strip()
+                  self.assertRegex(run_id, r"^\\d{8}T\\d{6}Z-[0-9a-f]{8}$")
+
+                  status = self.run_cli(
+                      sys.executable,
+                      str(RUNNER),
+                      "status",
+                      run_id,
+                      "--json",
+                      env=self.fixture.env(),
+                  )
+                  self.assertEqual(status.returncode, 0, status.stderr)
+                  state = json.loads(status.stdout)
+                  self.assertTrue(state["warnings"])
+                  self.assertEqual(
+                      {role["id"]: role["mode"] for role in state["roles"]},
+                      {
+                          "background-ask": "ask",
+                          "background-plan": "plan",
+                          "background-writer": "agent",
+                      },
+                  )
+
+                  wait = self.run_cli(
+                      sys.executable,
+                      str(RUNNER),
+                      "wait",
+                      run_id,
+                      "--poll",
+                      "0.05",
+                      env=self.fixture.env(),
+                  )
+                  self.assertEqual(wait.returncode, 0, wait.stderr)
+                  self.assertIn("succeeded", wait.stdout)
+
+                  collected = self.run_cli(
+                      sys.executable,
+                      str(RUNNER),
+                      "collect",
+                      run_id,
+                      env=self.fixture.env(),
+                  )
+                  self.assertEqual(collected.returncode, 0)
+                  self.assertIn("handoff role=background-ask", collected.stdout)
+                  self.assertIn("handoff role=background-plan", collected.stdout)
+                  self.assertIn("handoff role=background-writer", collected.stdout)
+                  trace = self.fixture.trace.read_text()
+                  self.assertIn("background-ask|force=1|trust=1|mode=ask", trace)
+                  self.assertIn("background-plan|force=1|trust=1|mode=plan", trace)
+                  self.assertIn("background-writer|force=1|trust=1|mode=|", trace)''',
+          )
+
+          replace_once(
+              "README.md",
+              '''Write authority comes from Cursor's agent mode, not from `--force`. Workers are non-interactive, so `--trust`, `--approve-mcps`, and `--force` are passed to every role — an unanswered prompt would otherwise kill the worker before it produced anything. Those flags suppress prompts; they do not grant edit authority. The two directions are bound together and checked before launch: a role declaring `"mode": "agent"` without `--writer` is rejected, and a `--writer` role that is not in agent mode is rejected rather than running silently read-only.
+
+              The writer may mutate''',
+              '''Write authority comes from Cursor's agent mode, not from `--force`. Workers are non-interactive, so `--trust`, `--approve-mcps`, and `--force` are passed to every role — an unanswered prompt would otherwise kill the worker before it produced anything. Those flags suppress prompts; they do not grant edit authority. The two directions are bound together and checked before launch: a role declaring `"mode": "agent"` without `--writer` is rejected, and a `--writer` role that is not in agent mode is rejected rather than running silently read-only.
+
+              Cursor accepts only `ask` and `plan` as explicit `--mode` values in this CLI interface. Agent mode remains fully supported: Cursor Cult selects Cursor's default agent behavior by omitting `--mode`, never by passing the invalid `--mode agent`. A fleet may mix `ask`, `plan`, and one authorized `agent` writer. Both foreground `run` and detached `start` print a warning naming the agent writer and explaining that it can edit files and run commands; detached run state preserves the same warning.
+
+              The writer may mutate''',
+          )
+          replace_once(
+              "README.md",
+              '''Only an explicitly detached/background request should return before completion:
+
+              ```zsh''',
+              '''Only an explicitly detached/background request should return before completion. Detached fleets support the same mixed `ask`/`plan`/authorized-`agent` role set as foreground fleets; add `--writer <role-id>` when `roles.json` contains the agent writer:
+
+              ```zsh''',
+          )
+
+          replace_once(
+              "skills/cursor-cult/SKILL.md",
+              '''Use `ask` for investigation. `agent` is write-capable and is rejected unless that same role is passed as `--writer`.''',
+              '''Use `ask` for investigation and `plan` for read-only planning. `agent` is write-capable and is rejected unless that same role is passed as `--writer`. Cursor accepts only `ask` and `plan` as explicit `--mode` values, so the runner selects agent mode by omitting `--mode`. One fleet may mix all three modes, with at most one authorized agent writer in a shared worktree.''',
+          )
+          replace_once(
+              "skills/cursor-cult/SKILL.md",
+              '''Add exactly one `--writer <role-id>` only when authorized. Do not impose an outer wall-clock timeout''',
+              '''Add exactly one `--writer <role-id>` only when authorized. The runner prints a clear warning whenever that agent writer is launched, including through detached `start`, because agent mode can edit files and run commands. Do not impose an outer wall-clock timeout''',
+          )
+          replace_once(
+              "codex-skills/cursor-cult/SKILL.md",
+              '''Use `mode: "ask"` for investigation. `mode: "agent"` is write-capable and is rejected unless that same role is passed as `--writer`. The runner treats role IDs as opaque host-created identities; it contains no catalog.''',
+              '''Use `mode: "ask"` for investigation and `mode: "plan"` for read-only planning. `mode: "agent"` is write-capable and is rejected unless that same role is passed as `--writer`. Cursor accepts only `ask` and `plan` as explicit `--mode` values, so the runner selects agent mode by omitting `--mode`. One fleet may mix all three modes, with at most one authorized agent writer in a shared worktree. The runner treats role IDs as opaque host-created identities; it contains no catalog.''',
+          )
+          replace_once(
+              "codex-skills/cursor-cult/SKILL.md",
+              '''Add exactly one `--writer <role-id>` only when that role is authorized to edit this worktree. Do not impose an outer wall-clock timeout''',
+              '''Add exactly one `--writer <role-id>` only when that role is authorized to edit this worktree. The runner prints a clear warning whenever that agent writer is launched, including through detached `start`, because agent mode can edit files and run commands. Do not impose an outer wall-clock timeout''',
+          )
+          PY
+      - name: Synchronize packaged copies
+        run: ./scripts/sync_packages.sh
+      - name: Verify patch
+        run: |
+          python3 -m py_compile scripts/cursor_cult.py tests/test_cursor_cult.py
+          python3 -m unittest discover -s tests -v
+          bash -n bin/cursor-cult scripts/*.sh tests/fake_cursor_agent.sh
+          ./scripts/sync_packages.sh --check
+      - name: Commit final patch and remove temporary workflow
+        shell: bash
+        run: |
+          rm .github/workflows/agent-mode-warning-autofix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Warn before agent-mode fleet execution"
+          git push origin HEAD:agent/agent-mode-background-warning
