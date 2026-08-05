@@ -1,6 +1,6 @@
 {
   "name": "cursor-cult",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Dynamic, host-composed Cursor CLI worker fleets for Codex.",
   "author": {"name": "ehzawad"},
   "homepage": "https://github.com/ehzawad/cursor-cult",

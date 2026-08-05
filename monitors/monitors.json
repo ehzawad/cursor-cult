@@ -1,0 +1,8 @@
+[
+  {
+    "name": "cursor-cult-runs",
+    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/cursor-cult/scripts/cursor_cult.py\" watch-all --cwd \"${CLAUDE_PROJECT_DIR}\" --format jsonl",
+    "description": "Cursor Cult role events, nine-minute heartbeats, and terminal completion",
+    "when": "on-skill-invoke:cursor-cult"
+  }
+]
