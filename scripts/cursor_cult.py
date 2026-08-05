@@ -39,6 +39,10 @@ STALE_SESSION_PATTERNS = (
     "resume session",
 )
 API_ENV_KEYS = ("CURSOR_API_KEY", "CURSOR_AGENT_API_KEY")
+AGENT_MODE_EXPLANATION = (
+    "Cursor CLI agent mode is selected by omitting `--mode`; this CLI version "
+    "accepts only `ask` and `plan` as explicit `--mode` values."
+)
 INTENT_HEADINGS = (
     "# Intent Capsule",
     "## Verbatim request",
@@ -900,6 +904,37 @@ def validate_write_authority(roles: Sequence[Role], writer_ids: set[str]) -> Non
         )
 
 
+def agent_mode_notice(
+    roles: Sequence[Role],
+    writer_ids: set[str],
+    *,
+    execution: str,
+) -> str | None:
+    agent_writers = [
+        role for role in roles if role.id in writer_ids and role.mode == "agent"
+    ]
+    if not agent_writers:
+        return None
+    names = ", ".join(f"{role.id} ({role.label})" for role in agent_writers)
+    return (
+        f"WARNING: {execution} includes Cursor agent mode for writer role(s): {names}. "
+        "Agent mode can edit files and run commands. "
+        f"{AGENT_MODE_EXPLANATION}"
+    )
+
+
+def emit_agent_mode_notice(
+    roles: Sequence[Role],
+    writer_ids: set[str],
+    *,
+    execution: str,
+) -> str | None:
+    notice = agent_mode_notice(roles, writer_ids, execution=execution)
+    if notice:
+        print(notice, file=sys.stderr)
+    return notice
+
+
 async def execute_fleet(
     *,
     roles: Sequence[Role],
@@ -1025,8 +1060,15 @@ def copy_background_inputs(
             "status": "queued",
             "created_at": utc_now(),
             "updated_at": utc_now(),
+            "warnings": list(config.get("warnings", [])),
             "roles": [
-                {"id": role.id, "label": role.label, "status": "queued"} for role in roles
+                {
+                    "id": role.id,
+                    "label": role.label,
+                    "mode": role.mode,
+                    "status": "queued",
+                }
+                for role in roles
             ],
         },
     )
@@ -1216,7 +1258,9 @@ async def command_run(ns: argparse.Namespace) -> int:
     roles, context, root, cli, capabilities, _ = prepare_invocation(ns)
     # Validate before the crash-recovery region below, which would otherwise
     # report an invalid invocation as a fleet failure instead of exit 2.
-    validate_write_authority(roles, set(ns.writer))
+    writer_ids = set(ns.writer)
+    validate_write_authority(roles, writer_ids)
+    emit_agent_mode_notice(roles, writer_ids, execution="foreground run")
     registry = ActiveProcessRegistry()
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()
@@ -1236,7 +1280,7 @@ async def command_run(ns: argparse.Namespace) -> int:
             context=context,
             root=root,
             cli=cli,
-            writer_ids=set(ns.writer),
+            writer_ids=writer_ids,
             max_parallel=ns.max_parallel,
             resume=not ns.no_resume,
             session_key=derive_session_key(ns.session_key),
@@ -1272,6 +1316,7 @@ def command_check(ns: argparse.Namespace) -> int:
     roles, context, root, cli, capabilities, status_output = prepare_invocation(ns)
     writer_ids = set(ns.writer)
     validate_write_authority(roles, writer_ids)
+    notice = agent_mode_notice(roles, writer_ids, execution="validated fleet")
     payload = {
         "ok": True,
         "version": VERSION,
@@ -1283,6 +1328,7 @@ def command_check(ns: argparse.Namespace) -> int:
         "session_key": derive_session_key(ns.session_key),
         "capabilities": dataclasses.asdict(capabilities),
         "api_environment_stripped": list(API_ENV_KEYS),
+        "warnings": [notice] if notice else [],
     }
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
@@ -1292,6 +1338,11 @@ def command_start(ns: argparse.Namespace) -> int:
     roles, context, root, cli, capabilities, _ = prepare_invocation(ns)
     writer_ids = set(ns.writer)
     validate_write_authority(roles, writer_ids)
+    notice = emit_agent_mode_notice(
+        roles,
+        writer_ids,
+        execution="detached/background run",
+    )
 
     run_id = new_run_id()
     run_dir = run_dir_for(run_id)
@@ -1305,6 +1356,7 @@ def command_start(ns: argparse.Namespace) -> int:
         "resume": not ns.no_resume,
         "session_key": derive_session_key(ns.session_key),
         "require_login_auth": not ns.allow_non_login_auth,
+        "warnings": [notice] if notice else [],
     }
     copy_background_inputs(run_dir, roles, context, config)
 
@@ -1370,8 +1422,12 @@ def command_status(ns: argparse.Namespace) -> int:
         print(json.dumps(state, indent=2, sort_keys=True))
     else:
         print(f"{state.get('run_id', ns.run_id)}\t{state.get('status', 'unknown')}")
+        for warning in state.get("warnings", []):
+            print(f"  {warning}")
         for role in state.get("roles", []):
-            print(f"  {role.get('id')}\t{role.get('status')}")
+            print(
+                f"  {role.get('id')}\t{role.get('status')}\tmode={role.get('mode', 'unknown')}"
+            )
     return 0
 
 

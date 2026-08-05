@@ -209,6 +209,29 @@ class CursorCultUnitTests(unittest.TestCase):
         reader = M.Role("reader", "Reader", "Investigate", "ask")
         args = M.build_cursor_args("cursor-agent", reader, "prompt", None, False, FULL_CAPS)
         self.assertEqual(args[args.index("--mode") + 1], "ask")
+        planner = M.Role("planner", "Planner", "Plan", "plan")
+        args = M.build_cursor_args("cursor-agent", planner, "prompt", None, False, FULL_CAPS)
+        self.assertEqual(args[args.index("--mode") + 1], "plan")
+
+    def test_agent_mode_notice_explains_risk_and_cli_compatibility(self) -> None:
+        writer = M.Role("writer", "Writer", "Implement", "agent")
+        notice = M.agent_mode_notice(
+            [writer],
+            {"writer"},
+            execution="detached/background run",
+        )
+        self.assertIsNotNone(notice)
+        assert notice is not None
+        self.assertIn("can edit files and run commands", notice)
+        self.assertIn("omitting `--mode`", notice)
+        self.assertIn("only `ask` and `plan`", notice)
+        self.assertIsNone(
+            M.agent_mode_notice(
+                [M.Role("reader", "Reader", "Inspect", "ask")],
+                set(),
+                execution="foreground run",
+            )
+        )
 
     def test_agent_mode_requires_writer_authorization(self) -> None:
         import asyncio
@@ -281,6 +304,8 @@ class CursorCultIntegrationTests(unittest.TestCase):
         # and only the authorized writer runs in Cursor's default (agent) mode.
         self.assertIn("first-lens|force=1|trust=1|mode=ask", trace)
         self.assertIn("local-change|force=1|trust=1|mode=|", trace)
+        self.assertIn("WARNING: foreground run includes Cursor agent mode", result.stderr)
+        self.assertIn("omitting `--mode`", result.stderr)
         self.assertIn(M.DONE_SENTINEL, result.stderr)
 
     def test_partial_failure_preserves_success(self) -> None:
@@ -421,13 +446,62 @@ class CursorCultIntegrationTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["roles"][0]["id"], "odd-task-lens")
         self.assertEqual(set(payload["api_environment_stripped"]), {"CURSOR_API_KEY", "CURSOR_AGENT_API_KEY"})
+        self.assertEqual(payload["warnings"], [])
 
-    def test_background_start_wait_collect(self) -> None:
-        self.fixture.write_roles([{"id": "background-lens", "label": "Background", "instruction": "Inspect"}])
-        started = self.run_cli(*self.fixture.command("start"))
+    def test_background_start_wait_collect_with_mixed_modes(self) -> None:
+        self.fixture.write_roles(
+            [
+                {
+                    "id": "background-ask",
+                    "label": "Background ask",
+                    "instruction": "Inspect",
+                    "mode": "ask",
+                },
+                {
+                    "id": "background-plan",
+                    "label": "Background plan",
+                    "instruction": "Plan",
+                    "mode": "plan",
+                },
+                {
+                    "id": "background-writer",
+                    "label": "Background writer",
+                    "instruction": "Implement",
+                    "mode": "agent",
+                },
+            ]
+        )
+        started = self.run_cli(
+            *self.fixture.command("start", "--writer", "background-writer")
+        )
         self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertIn(
+            "WARNING: detached/background run includes Cursor agent mode",
+            started.stderr,
+        )
+        self.assertIn("omitting `--mode`", started.stderr)
         run_id = started.stdout.strip()
         self.assertRegex(run_id, r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
+
+        status = self.run_cli(
+            sys.executable,
+            str(RUNNER),
+            "status",
+            run_id,
+            "--json",
+            env=self.fixture.env(),
+        )
+        self.assertEqual(status.returncode, 0, status.stderr)
+        state = json.loads(status.stdout)
+        self.assertTrue(state["warnings"])
+        self.assertEqual(
+            {role["id"]: role["mode"] for role in state["roles"]},
+            {
+                "background-ask": "ask",
+                "background-plan": "plan",
+                "background-writer": "agent",
+            },
+        )
 
         wait = self.run_cli(
             sys.executable,
@@ -449,7 +523,13 @@ class CursorCultIntegrationTests(unittest.TestCase):
             env=self.fixture.env(),
         )
         self.assertEqual(collected.returncode, 0)
-        self.assertIn("handoff role=background-lens", collected.stdout)
+        self.assertIn("handoff role=background-ask", collected.stdout)
+        self.assertIn("handoff role=background-plan", collected.stdout)
+        self.assertIn("handoff role=background-writer", collected.stdout)
+        trace = self.fixture.trace.read_text()
+        self.assertIn("background-ask|force=1|trust=1|mode=ask", trace)
+        self.assertIn("background-plan|force=1|trust=1|mode=plan", trace)
+        self.assertIn("background-writer|force=1|trust=1|mode=|", trace)
 
     def test_background_cancel_terminates_worker(self) -> None:
         self.fixture.write_roles([{"id": "slow-lens", "label": "Slow", "instruction": "Inspect slowly"}])

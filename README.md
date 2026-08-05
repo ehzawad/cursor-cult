@@ -198,6 +198,8 @@ cursor-cult run ... --writer exact-role-id
 
 Write authority comes from Cursor's agent mode, not from `--force`. Workers are non-interactive, so `--trust`, `--approve-mcps`, and `--force` are passed to every role — an unanswered prompt would otherwise kill the worker before it produced anything. Those flags suppress prompts; they do not grant edit authority. The two directions are bound together and checked before launch: a role declaring `"mode": "agent"` without `--writer` is rejected, and a `--writer` role that is not in agent mode is rejected rather than running silently read-only.
 
+Cursor accepts only `ask` and `plan` as explicit `--mode` values in this CLI interface. Agent mode remains fully supported: Cursor Cult selects Cursor's default agent behavior by omitting `--mode`, never by passing the invalid `--mode agent`. A fleet may mix `ask`, `plan`, and one authorized `agent` writer. Both foreground `run` and detached `start` print a warning naming the agent writer and explaining that it can edit files and run commands; detached run state preserves the same warning.
+
 The writer may mutate the local worktree within the Intent Capsule, but it may not commit, push, open or merge a PR, deploy, publish, or mutate external services unless the capsule explicitly authorizes that exact action.
 
 Multiple writers are rejected in one invocation. Use isolated worktrees and separate fleets when parallel implementation is genuinely safe.
@@ -230,7 +232,7 @@ The runner emits Markdown by default and ends normal stderr with `CURSOR_CULT_DO
 
 ## Explicit detached execution
 
-Only an explicitly detached/background request should return before completion:
+Only an explicitly detached/background request should return before completion. Detached fleets support the same mixed `ask`/`plan`/authorized-`agent` role set as foreground fleets; add `--writer <role-id>` when `roles.json` contains the agent writer:
 
 ```zsh
 RUN_ID="$(python3 scripts/cursor_cult.py start \
