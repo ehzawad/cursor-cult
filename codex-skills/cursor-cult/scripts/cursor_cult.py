@@ -362,7 +362,18 @@ def state_root() -> Path:
 
 
 def runs_root() -> Path:
-    return state_root() / "runs"
+    """The run root, created 0700.
+
+    Individual run directories are already 0700, but `mkdir(parents=True, mode=...)`
+    applies its mode only to the leaf, so both parents were left at the umask default
+    of 0755 — letting any local user enumerate run IDs, project names, and timing.
+    """
+    root = state_root() / "runs"
+    for path in (root.parent, root):
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with contextlib.suppress(OSError):
+            path.chmod(0o700)
+    return root
 
 
 def derive_session_key(explicit: str | None) -> str:
@@ -619,6 +630,11 @@ async def consume_stream(
         return ""
     chunks: list[str] = []
     handle = sink.open("a", encoding="utf-8") if sink is not None else None
+    if handle is not None:
+        # Per-role stdout/stderr hold raw worker output; give them the same 0600 as
+        # every other run artifact instead of leaving them to the ambient umask.
+        with contextlib.suppress(OSError):
+            os.fchmod(handle.fileno(), 0o600)
     try:
         while True:
             raw = await stream.readline()
@@ -1936,6 +1952,10 @@ def command_start(ns: argparse.Namespace) -> int:
     copy_background_inputs(run_dir, roles, context, config)
 
     log_handle = (run_dir / "supervisor.log").open("ab", buffering=0)
+    # Match the 0600 every other run artifact gets; this captures supervisor tracebacks
+    # and Cursor stderr just like they do.
+    with contextlib.suppress(OSError):
+        os.fchmod(log_handle.fileno(), 0o600)
     try:
         proc = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "_supervise", str(run_dir)],

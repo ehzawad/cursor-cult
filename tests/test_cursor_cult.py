@@ -671,17 +671,33 @@ class CursorCultUnitTests(unittest.TestCase):
             self.assertIn("process id", event["details"]["reason"])
 
     def test_version_metadata_matches_runner(self) -> None:
-        self.assertEqual(M.VERSION, "0.5.0")
+        # Derive everything from M.VERSION so this never needs editing on a bump, and
+        # compare parsed fields rather than substrings so a stale version elsewhere in
+        # the file cannot hide behind a match.
+        self.assertRegex(M.VERSION, r"^\d+\.\d+\.\d+$")
+
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        declared = re.findall(r'^version\s*=\s*"([^"]+)"', pyproject, re.MULTILINE)
+        self.assertEqual(declared, [M.VERSION], "pyproject.toml")
+
         for path in (
-            ROOT / "pyproject.toml",
             ROOT / ".claude-plugin" / "plugin.json",
             ROOT / ".codex-plugin" / "plugin.json",
             ROOT / "plugins" / "cursor-cult" / ".claude-plugin" / "plugin.json",
             ROOT / "plugins" / "cursor-cult-codex" / ".codex-plugin" / "plugin.json",
         ):
-            content = path.read_text(encoding="utf-8")
-            self.assertIn(M.VERSION, content, str(path))
-            self.assertNotIn("0.4.1", content, str(path))
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")).get("version"),
+                M.VERSION,
+                str(path),
+            )
+
+        # A release body is cut from the CHANGELOG entry, so a bump without one cannot
+        # be published. 0.5.0 reached a tagged head with no entry; this closes that.
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        headings = re.findall(r"^##\s+(\d+\.\d+\.\d+)\b", changelog, re.MULTILINE)
+        self.assertTrue(headings, "CHANGELOG.md has no version headings")
+        self.assertEqual(headings[0], M.VERSION, "CHANGELOG.md top entry")
 
     def test_packaged_copies_match_their_sources(self) -> None:
         check = subprocess.run(
@@ -1170,7 +1186,17 @@ class CursorCultIntegrationTests(unittest.TestCase):
                 "--session-key", "someone-elses-session",
             ).stdout
         )
-        for run in (mine, other_session):
+        # A second project root under the same state dir, so the project_root filter is
+        # genuinely exercised rather than only the session filter.
+        other_project = Path(self.fixture.root) / "other-repo"
+        (other_project / ".git").mkdir(parents=True)
+        other_project_run = json.loads(
+            self.run_cli(
+                *self.fixture.command("start", "--json"),
+                "--cwd", str(other_project),
+            ).stdout
+        )
+        for run in (mine, other_session, other_project_run):
             self.run_cli(
                 sys.executable, str(RUNNER), "wait", run["run_id"], "--poll", "0.02",
                 env=self.fixture.env(),
@@ -1201,6 +1227,11 @@ class CursorCultIntegrationTests(unittest.TestCase):
         self.assertIn(mine["run_id"], observed, "own-session run must be replayed")
         self.assertNotIn(
             other_session["run_id"], observed, "another session's run must be filtered out"
+        )
+        self.assertNotIn(
+            other_project_run["run_id"],
+            observed,
+            "another project's run must be filtered out",
         )
 
 
