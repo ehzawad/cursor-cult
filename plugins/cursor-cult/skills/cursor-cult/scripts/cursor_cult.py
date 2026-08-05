@@ -1209,14 +1209,10 @@ def record_run_event(
                 if state_path.exists()
                 else {}
             )
-            if mutate is not None:
-                mutate(state)
-            # Snapshot `details` only after `mutate` has run. Callers such as
-            # supervise_run's progress() enrich the very dict they passed in from
-            # inside their mutate closure, so copying beforehand silently dropped
-            # mode, role_status, duration_ms and error from every role event and left
-            # every role_completed message reading "status unknown".
-            details = dict(details or {})
+            # Evaluate the suppression guards BEFORE mutating. Both depend only on the
+            # persisted state and journal, and running mutate first meant a suppressed
+            # event still applied the caller's mutation to `state` and returned it —
+            # handing the caller a state object that was never written to disk.
             if (
                 event_type == "heartbeat"
                 and state.get("status") in TERMINAL_RUN_STATUSES
@@ -1229,6 +1225,14 @@ def record_run_event(
                     and last_persisted.get("event") in TERMINAL_EVENT_TYPES
                 ):
                     return state, {}
+            if mutate is not None:
+                mutate(state)
+            # Snapshot `details` only after `mutate` has run. Callers such as
+            # supervise_run's progress() enrich the very dict they passed in from
+            # inside their mutate closure, so copying beforehand silently dropped
+            # mode, role_status, duration_ms and error from every role event and left
+            # every role_completed message reading "status unknown".
+            details = dict(details or {})
             now = utc_now()
             sequence = int(state.get("event_sequence", 0)) + 1
             state["event_sequence"] = sequence
@@ -1383,15 +1387,29 @@ async def emit_heartbeats(run_dir: Path, heartbeat_seconds: float) -> None:
     deadline = loop.time() + heartbeat_seconds
     while True:
         await asyncio.sleep(max(0.0, deadline - loop.time()))
-        state = load_run_state(run_dir)
-        if state.get("status") in TERMINAL_RUN_STATUSES:
-            return
-        record_run_event(
-            run_dir,
-            "heartbeat",
-            details={"heartbeat_seconds": heartbeat_seconds},
-        )
         deadline = loop.time() + heartbeat_seconds
+        # A transient state/journal error must not kill the beat. An unhandled
+        # exception here would end the task silently — suppressing the very liveness
+        # signal the watchdog exists to provide, for the rest of the run — and then
+        # surface later when the supervisor awaits the task, letting a dead heartbeat
+        # override a run that otherwise succeeded.
+        try:
+            state = load_run_state(run_dir)
+            if state.get("status") in TERMINAL_RUN_STATUSES:
+                return
+            record_run_event(
+                run_dir,
+                "heartbeat",
+                details={"heartbeat_seconds": heartbeat_seconds},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - liveness must outlive its own errors
+            print(
+                f"cursor-cult: heartbeat for {run_dir.name} failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
 
 
 def render_watch_event(event: dict[str, Any], output_format: str) -> str:
@@ -1656,7 +1674,9 @@ async def supervise_run(run_dir: Path) -> int:
         return 1
     finally:
         heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        # Never let the heartbeat's own fate change the run's outcome: the terminal
+        # event is already persisted by this point.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await heartbeat_task
 
 

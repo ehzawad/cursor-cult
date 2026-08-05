@@ -510,6 +510,46 @@ class CursorCultUnitTests(unittest.TestCase):
             again = (run_dir / "events.ndjson").read_text().splitlines()
             self.assertEqual(len(again), 1)
 
+    def test_suppressed_event_does_not_apply_or_return_an_unpersisted_mutation(self) -> None:
+        # The suppression guards must run before mutate. Mutating first meant a
+        # dropped duplicate still applied the caller's change to the state object and
+        # handed it back, so callers acted on state that was never written to disk.
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            M.atomic_write_json(
+                run_dir / "state.json",
+                {
+                    "run_id": run_dir.name,
+                    "status": "succeeded",
+                    "created_at": M.utc_now(),
+                    "event_sequence": 1,
+                    "roles": [],
+                },
+            )
+            M.append_event_line(
+                run_dir / "events.ndjson",
+                {
+                    "schema": M.EVENT_SCHEMA,
+                    "sequence": 1,
+                    "run_id": run_dir.name,
+                    "event": "run_completed",
+                },
+            )
+
+            def clobber(state: dict) -> None:
+                state["status"] = "failed"
+                state["exit_code"] = 1
+
+            state, event = M.record_run_event(run_dir, "run_failed", clobber)
+            self.assertEqual(event, {}, "a duplicate terminal event must be suppressed")
+            self.assertEqual(state["status"], "succeeded", "mutation must not be applied")
+            self.assertNotIn("exit_code", state)
+            self.assertEqual(M.load_run_state(run_dir)["status"], "succeeded")
+            self.assertEqual(
+                len((run_dir / "events.ndjson").read_text().splitlines()), 1
+            )
+
     def test_terminal_event_is_recovered_if_state_outlives_journal_append(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run"
