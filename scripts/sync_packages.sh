@@ -11,6 +11,8 @@ CLAUDE_SRC=skills/cursor-cult
 CODEX_SRC=codex-skills/cursor-cult
 CLAUDE_PKG=plugins/cursor-cult/skills/cursor-cult
 CODEX_PKG=plugins/cursor-cult-codex/skills/cursor-cult
+CLAUDE_MONITORS=monitors
+CLAUDE_MONITORS_PKG=plugins/cursor-cult/monitors
 
 status=0
 mirror() {
@@ -37,6 +39,7 @@ mirror_file() {
 
 mirror "$CLAUDE_SRC" "$CLAUDE_PKG"
 mirror "$CODEX_SRC" "$CODEX_PKG"
+mirror "$CLAUDE_MONITORS" "$CLAUDE_MONITORS_PKG"
 for tree in "$CLAUDE_SRC" "$CODEX_SRC" "$CLAUDE_PKG" "$CODEX_PKG"; do
   mirror_file "$RUNNER" "$tree/scripts/cursor_cult.py"
 done

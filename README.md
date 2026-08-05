@@ -188,6 +188,12 @@ Those are examples, not built-in roles. A research task, mathematical proof, pro
 
 After a round, the host reconciles the handoffs and inspects the actual workspace again. It may continue one semantic role by reusing its ID, retire every previous role, or create new roles around newly discovered uncertainty.
 
+## Mode and fleet selection
+
+Claude Code or Codex chooses a mode **per role** from the current user prompt, conversation, live repository evidence, and authority boundaries; the runner validates and executes that decision. Explicit user direction wins. `ask` is read-only investigation, explanation, diagnosis, or review. `plan` is a structured read-only strategy. `agent` is reserved for authorized edits or locally mutating commands. Every role may record a `mode_reason` for auditability.
+
+Multi-agent is fleet topology, not a fourth Cursor mode. Independent `ask` and `plan` roles can fan out concurrently, and a fleet can include one authorized `agent` writer in a shared worktree. Concurrent agent writers use isolated worktrees and separate Cursor Cult invocations, which the host may run and watch in parallel. Roles are recomposed after material evidence; there is no compulsory ask → plan → agent pipeline.
+
 ## Writer model
 
 Read-only workers receive an explicit no-mutation contract. A single role can be appointed as writer, and that role must declare `"mode": "agent"`:
@@ -230,16 +236,43 @@ python3 scripts/cursor_cult.py run \
 
 The runner emits Markdown by default and ends normal stderr with `CURSOR_CULT_DONE`. Use `--format json` for automation.
 
-## Explicit detached execution
+## Durable asynchronous execution and watchdog events
 
-Only an explicitly detached/background request should return before completion. Detached fleets support the same mixed `ask`/`plan`/authorized-`agent` role set as foreground fleets; add `--writer <role-id>` when `roles.json` contains the agent writer:
+For detached or plausibly long work, use `start --json`, not an untracked shell background process. `start` returns the durable run ID, event path, event schema, heartbeat interval, and an exact `watch_command`:
 
 ```zsh
-RUN_ID="$(python3 scripts/cursor_cult.py start \
+LAUNCH="$(python3 scripts/cursor_cult.py start --json \
   --roles-file "$RUN/roles.json" \
   --context-file "$RUN/context.md" \
   --cwd . \
   --session-key "manual:example")"
+```
+
+Each detached supervisor writes `cursor-cult.event.v1` JSONL records for queueing, run start, role start/finish, heartbeats, completion, failure, and cancellation. The default heartbeat interval is exactly `540` seconds (nine minutes). It is persisted in run state and can be changed for tests or operations with `--heartbeat-seconds` or `CURSOR_CULT_HEARTBEAT_SECONDS`.
+
+```zsh
+python3 scripts/cursor_cult.py watch <run-id>
+python3 scripts/cursor_cult.py watch <run-id> --after-sequence 12
+```
+
+`watch` replays and follows one journal, flushes every event immediately, and exits after the terminal event. Claude Code plugin installs include a session monitor that starts on the first skill invocation and delivers every watchdog line to the live Claude harness. Codex hosts attach the returned `watch_command` to a Codex-managed background terminal so output deltas and process completion return to the main harness. Manual recovery remains available through `status`, `tail`, `wait`, `collect`, and `cancel`.
+
+## Explicit detached execution
+
+Detached fleets support the same mixed `ask`/`plan`/authorized-`agent` role set as foreground fleets; add `--writer <role-id>` when `roles.json` contains the agent writer. Prefer `start --json` so the host can attach the returned watchdog command:
+
+```zsh
+LAUNCH="$(python3 scripts/cursor_cult.py start \
+  --json \
+  --roles-file "$RUN/roles.json" \
+  --context-file "$RUN/context.md" \
+  --cwd . \
+  --session-key "manual:example")"
+RUN_ID="$(printf '%s' "$LAUNCH" | python3 -c 'import json, sys; print(json.load(sys.stdin)["run_id"])')"
+WATCH_COMMAND="$(printf '%s' "$LAUNCH" | python3 -c 'import json, shlex, sys; print(shlex.join(json.load(sys.stdin)["watch_command"]))')"
+
+# Attach this command through the host's managed background-process primitive.
+eval "$WATCH_COMMAND"
 
 python3 scripts/cursor_cult.py status "$RUN_ID"
 python3 scripts/cursor_cult.py tail "$RUN_ID" --follow

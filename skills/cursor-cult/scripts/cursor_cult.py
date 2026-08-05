@@ -43,6 +43,9 @@ AGENT_MODE_EXPLANATION = (
     "Cursor CLI agent mode is selected by omitting `--mode`; this CLI version "
     "accepts only `ask` and `plan` as explicit `--mode` values."
 )
+EVENT_SCHEMA = "cursor-cult.event.v1"
+DEFAULT_HEARTBEAT_SECONDS = 9 * 60
+TERMINAL_EVENT_TYPES = {"run_completed", "run_failed", "run_cancelled"}
 INTENT_HEADINGS = (
     "# Intent Capsule",
     "## Verbatim request",
@@ -71,6 +74,7 @@ class Role:
     instruction: str
     mode: str = "ask"
     model: str | None = None
+    mode_reason: str | None = None
 
 
 @dataclasses.dataclass
@@ -236,6 +240,7 @@ def parse_roles(path: Path) -> list[Role]:
         instruction = item.get("instruction")
         mode = item.get("mode", "ask")
         model = item.get("model")
+        mode_reason = item.get("mode_reason")
 
         if not isinstance(role_id, str) or ROLE_ID_RE.fullmatch(role_id) is None:
             raise UsageError(
@@ -255,6 +260,10 @@ def parse_roles(path: Path) -> list[Role]:
             raise UsageError(f"role[{index}].mode must be ask, agent, or plan")
         if model is not None and (not isinstance(model, str) or not model.strip()):
             raise UsageError(f"role[{index}].model must be a non-empty string")
+        if mode_reason is not None and (
+            not isinstance(mode_reason, str) or not mode_reason.strip()
+        ):
+            raise UsageError(f"role[{index}].mode_reason must be a non-empty string")
 
         seen.add(role_id)
         roles.append(
@@ -264,6 +273,9 @@ def parse_roles(path: Path) -> list[Role]:
                 instruction=instruction.strip(),
                 mode=mode,
                 model=model.strip() if isinstance(model, str) else None,
+                mode_reason=(
+                    mode_reason.strip() if isinstance(mode_reason, str) else None
+                ),
             )
         )
     return roles
@@ -1042,6 +1054,259 @@ def update_run_state(run_dir: Path, mutate: Callable[[dict[str, Any]], None]) ->
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
+
+def parse_utc_timestamp(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def role_status_counts(state: dict[str, Any]) -> dict[str, int]:
+    counts = {"queued": 0, "running": 0, "succeeded": 0, "failed": 0, "cancelled": 0}
+    for role in state.get("roles", []):
+        status = role.get("status") if isinstance(role, dict) else None
+        if isinstance(status, str):
+            counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def run_elapsed_seconds(state: dict[str, Any]) -> int:
+    start = parse_utc_timestamp(state.get("started_at")) or parse_utc_timestamp(
+        state.get("created_at")
+    )
+    if start is None:
+        return 0
+    return max(0, int((dt.datetime.now(dt.timezone.utc) - start).total_seconds()))
+
+
+def event_message(
+    event_type: str,
+    state: dict[str, Any],
+    details: dict[str, Any],
+) -> str:
+    run_id = str(state.get("run_id", "unknown"))
+    status = str(state.get("status", "unknown"))
+    counts = role_status_counts(state)
+    if event_type == "run_queued":
+        return f"Cursor Cult run {run_id} queued."
+    if event_type == "run_started":
+        return f"Cursor Cult run {run_id} started."
+    if event_type == "role_started":
+        return (
+            f"Cursor Cult run {run_id}: role {details.get('role_id', 'unknown')} "
+            f"started in {details.get('mode', 'unknown')} mode."
+        )
+    if event_type == "role_completed":
+        return (
+            f"Cursor Cult run {run_id}: role {details.get('role_id', 'unknown')} "
+            f"finished with status {details.get('role_status', 'unknown')}."
+        )
+    if event_type == "heartbeat":
+        return (
+            f"Cursor Cult run {run_id} is still {status} after "
+            f"{run_elapsed_seconds(state)}s: {counts.get('running', 0)} running, "
+            f"{counts.get('queued', 0)} queued, {counts.get('succeeded', 0)} "
+            f"succeeded, {counts.get('failed', 0)} failed."
+        )
+    if event_type == "run_cancelled":
+        return f"Cursor Cult run {run_id} was cancelled."
+    if event_type == "run_failed":
+        reason = details.get("reason") or state.get("supervisor_error") or "unknown failure"
+        return f"Cursor Cult run {run_id} failed: {reason}"
+    if event_type == "run_completed":
+        return f"Cursor Cult run {run_id} completed with status {status}."
+    return f"Cursor Cult run {run_id}: {event_type}."
+
+
+def append_event_line(path: Path, event: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def record_run_event(
+    run_dir: Path,
+    event_type: str,
+    mutate: Callable[[dict[str, Any]], None] | None = None,
+    details: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    details = dict(details or {})
+    lock_path = run_dir / ".state.lock"
+    run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with lock_path.open("a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            state_path = run_dir / "state.json"
+            state = (
+                json.loads(state_path.read_text(encoding="utf-8"))
+                if state_path.exists()
+                else {}
+            )
+            if mutate is not None:
+                mutate(state)
+            if (
+                event_type == "heartbeat"
+                and state.get("status") in TERMINAL_RUN_STATUSES
+            ):
+                return state, {}
+            if (
+                event_type in TERMINAL_EVENT_TYPES
+                and state.get("last_event_type") in TERMINAL_EVENT_TYPES
+            ):
+                return state, {}
+            now = utc_now()
+            sequence = int(state.get("event_sequence", 0)) + 1
+            state["event_sequence"] = sequence
+            state["updated_at"] = now
+            state["last_event_at"] = now
+            state["last_event_type"] = event_type
+            if event_type == "heartbeat":
+                state["last_heartbeat_at"] = now
+            else:
+                state["last_progress_at"] = now
+            event = {
+                "schema": EVENT_SCHEMA,
+                "sequence": sequence,
+                "run_id": state.get("run_id", run_dir.name),
+                "event": event_type,
+                "at": now,
+                "status": state.get("status", "unknown"),
+                "elapsed_seconds": run_elapsed_seconds(state),
+                "summary": role_status_counts(state),
+                "roles": [
+                    {
+                        "id": role.get("id"),
+                        "label": role.get("label"),
+                        "mode": role.get("mode"),
+                        "status": role.get("status"),
+                    }
+                    for role in state.get("roles", [])
+                    if isinstance(role, dict)
+                ],
+                "details": details,
+            }
+            event["message"] = event_message(event_type, state, details)
+            atomic_write_json(state_path, state)
+            append_event_line(run_dir / "events.ndjson", event)
+            return state, event
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def terminal_event_for_status(status: str) -> str:
+    if status == "cancelled":
+        return "run_cancelled"
+    if status == "failed":
+        return "run_failed"
+    return "run_completed"
+
+
+def reconcile_run_liveness(run_dir: Path) -> dict[str, Any]:
+    state = load_run_state(run_dir)
+    status = str(state.get("status", "unknown"))
+    pid = state.get("pid")
+    if (
+        status in {"queued", "running"}
+        and isinstance(pid, int)
+        and not process_is_alive(pid)
+    ):
+        def fail(current: dict[str, Any]) -> None:
+            if current.get("status") not in {"queued", "running"}:
+                return
+            current.update(
+                {
+                    "status": "failed",
+                    "finished_at": current.get("finished_at") or utc_now(),
+                    "exit_code": 1,
+                    "supervisor_error": current.get("supervisor_error")
+                    or "supervisor process is no longer alive",
+                    "pid": None,
+                }
+            )
+
+        state, _ = record_run_event(
+            run_dir,
+            "run_failed",
+            fail,
+            {"reason": "supervisor process is no longer alive"},
+        )
+    return state
+
+
+def ensure_terminal_event(run_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
+    status = str(state.get("status", "unknown"))
+    if status not in TERMINAL_RUN_STATUSES:
+        return state
+    if state.get("last_event_type") in TERMINAL_EVENT_TYPES:
+        return state
+    state, _ = record_run_event(
+        run_dir,
+        terminal_event_for_status(status),
+        details={"outcome": status, "recovered": True},
+    )
+    return state
+
+
+async def emit_heartbeats(run_dir: Path, heartbeat_seconds: float) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + heartbeat_seconds
+    while True:
+        await asyncio.sleep(max(0.0, deadline - loop.time()))
+        state = load_run_state(run_dir)
+        if state.get("status") in TERMINAL_RUN_STATUSES:
+            return
+        record_run_event(
+            run_dir,
+            "heartbeat",
+            details={"heartbeat_seconds": heartbeat_seconds},
+        )
+        deadline = loop.time() + heartbeat_seconds
+
+
+def render_watch_event(event: dict[str, Any], output_format: str) -> str:
+    if output_format == "text":
+        return str(event.get("message") or event.get("event") or "Cursor Cult event")
+    return json.dumps(event, sort_keys=True)
+
+
+def stream_new_events(
+    events_path: Path,
+    offset: int,
+    after_sequence: int,
+    output_format: str,
+) -> tuple[int, bool]:
+    terminal_seen = False
+    if not events_path.exists():
+        return offset, terminal_seen
+    with events_path.open("r", encoding="utf-8", errors="replace") as handle:
+        handle.seek(offset)
+        while True:
+            line = handle.readline()
+            if not line:
+                break
+            offset = handle.tell()
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            sequence = event.get("sequence")
+            if isinstance(sequence, int) and sequence <= after_sequence:
+                continue
+            print(render_watch_event(event, output_format), flush=True)
+            if event.get("event") in TERMINAL_EVENT_TYPES:
+                terminal_seen = True
+    return offset, terminal_seen
+
 def copy_background_inputs(
     run_dir: Path,
     roles: Sequence[Role],
@@ -1053,25 +1318,36 @@ def copy_background_inputs(
     atomic_write_json(run_dir / "roles.json", [dataclasses.asdict(role) for role in roles])
     atomic_write_text(run_dir / "context.md", context)
     atomic_write_json(run_dir / "config.json", config)
+    created_at = utc_now()
     atomic_write_json(
         run_dir / "state.json",
         {
             "run_id": run_dir.name,
             "status": "queued",
-            "created_at": utc_now(),
-            "updated_at": utc_now(),
+            "created_at": created_at,
+            "updated_at": created_at,
+            "event_sequence": 0,
+            "last_event_at": None,
+            "last_event_type": None,
+            "last_progress_at": created_at,
+            "last_heartbeat_at": None,
+            "heartbeat_seconds": float(
+                config.get("heartbeat_seconds", DEFAULT_HEARTBEAT_SECONDS)
+            ),
             "warnings": list(config.get("warnings", [])),
             "roles": [
                 {
                     "id": role.id,
                     "label": role.label,
                     "mode": role.mode,
+                    "mode_reason": role.mode_reason,
                     "status": "queued",
                 }
                 for role in roles
             ],
         },
     )
+    record_run_event(run_dir, "run_queued")
 
 
 def process_is_alive(pid: int | None) -> bool:
@@ -1094,6 +1370,11 @@ async def supervise_run(run_dir: Path) -> int:
     cli = config["cursor_bin"]
     capabilities = CursorCapabilities(**config["capabilities"])
     writer_ids = set(config.get("writer_ids", []))
+    heartbeat_seconds = float(
+        config.get("heartbeat_seconds", DEFAULT_HEARTBEAT_SECONDS)
+    )
+    if heartbeat_seconds <= 0:
+        raise UsageError("heartbeat interval must be positive")
     registry = ActiveProcessRegistry()
 
     def mark_running(state: dict[str, Any]) -> None:
@@ -1101,26 +1382,41 @@ async def supervise_run(run_dir: Path) -> int:
         state["pid"] = os.getpid()
         state["started_at"] = utc_now()
 
-    update_run_state(run_dir, mark_running)
+    record_run_event(run_dir, "run_started", mark_running)
 
     def progress(role_id: str, result: RoleResult | None) -> None:
+        event_type = "role_started" if result is None else "role_completed"
+        details: dict[str, Any] = {"role_id": role_id}
+
         def mutate(state: dict[str, Any]) -> None:
             for role_state in state.get("roles", []):
-                if role_state.get("id") == role_id:
-                    if result is None:
-                        role_state["status"] = "running"
-                        role_state["started_at"] = utc_now()
-                    else:
-                        role_state.update(
-                            {
-                                "status": "succeeded" if result.ok else "failed",
-                                "finished_at": utc_now(),
-                                "duration_ms": result.duration_ms,
-                                "error": result.error,
-                            }
-                        )
-                    break
-        update_run_state(run_dir, mutate)
+                if role_state.get("id") != role_id:
+                    continue
+                details["mode"] = role_state.get("mode")
+                if result is None:
+                    role_state["status"] = "running"
+                    role_state["started_at"] = utc_now()
+                    details["role_status"] = "running"
+                else:
+                    role_status = "succeeded" if result.ok else "failed"
+                    details.update(
+                        {
+                            "role_status": role_status,
+                            "duration_ms": result.duration_ms,
+                            "error": result.error,
+                        }
+                    )
+                    role_state.update(
+                        {
+                            "status": role_status,
+                            "finished_at": utc_now(),
+                            "duration_ms": result.duration_ms,
+                            "error": result.error,
+                        }
+                    )
+                break
+
+        record_run_event(run_dir, event_type, mutate, details)
 
     loop = asyncio.get_running_loop()
     current_task = asyncio.current_task()
@@ -1128,6 +1424,10 @@ async def supervise_run(run_dir: Path) -> int:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, current_task.cancel if current_task else lambda: None)
 
+    heartbeat_task = asyncio.create_task(
+        emit_heartbeats(run_dir, heartbeat_seconds),
+        name=f"cursor-cult-heartbeat:{run_dir.name}",
+    )
     try:
         results = await execute_fleet(
             roles=roles,
@@ -1156,7 +1456,16 @@ async def supervise_run(run_dir: Path) -> int:
             state["exit_code"] = exit_code_for_status(status)
             state["pid"] = None
 
-        update_run_state(run_dir, finish)
+        record_run_event(
+            run_dir,
+            terminal_event_for_status(status),
+            finish,
+            {
+                "outcome": status,
+                "report_markdown": str(run_dir / "report.md"),
+                "report_json": str(run_dir / "report.json"),
+            },
+        )
         return exit_code_for_status(status)
     except asyncio.CancelledError:
         await registry.terminate_all()
@@ -1170,7 +1479,7 @@ async def supervise_run(run_dir: Path) -> int:
                 if role_state.get("status") in {"queued", "running"}:
                     role_state["status"] = "cancelled"
 
-        update_run_state(run_dir, cancel)
+        record_run_event(run_dir, "run_cancelled", cancel)
         return 130
     except Exception as exc:
         atomic_write_text(run_dir / "supervisor-error.log", f"{type(exc).__name__}: {exc}\n")
@@ -1182,8 +1491,17 @@ async def supervise_run(run_dir: Path) -> int:
             state["pid"] = None
             state["supervisor_error"] = f"{type(exc).__name__}: {exc}"
 
-        update_run_state(run_dir, fail)
+        record_run_event(
+            run_dir,
+            "run_failed",
+            fail,
+            {"reason": f"{type(exc).__name__}: {exc}"},
+        )
         return 1
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
 
 
 def prepare_invocation(ns: argparse.Namespace) -> tuple[list[Role], str, Path, str, CursorCapabilities, str]:
@@ -1237,6 +1555,35 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser = subparsers.add_parser("start", help="start a durable detached fleet")
     add_execution_arguments(start_parser)
     start_parser.add_argument("--json", action="store_true")
+    start_parser.add_argument(
+        "--heartbeat-seconds",
+        type=float,
+        default=float(
+            os.environ.get(
+                "CURSOR_CULT_HEARTBEAT_SECONDS",
+                str(DEFAULT_HEARTBEAT_SECONDS),
+            )
+        ),
+        help="watchdog heartbeat interval; defaults to 540 seconds (9 minutes)",
+    )
+
+    watch_parser = subparsers.add_parser(
+        "watch",
+        help="stream one detached run's persisted events until it terminates",
+    )
+    watch_parser.add_argument("run_id")
+    watch_parser.add_argument("--poll", type=float, default=0.5)
+    watch_parser.add_argument("--after-sequence", type=int, default=0)
+    watch_parser.add_argument("--format", choices=("jsonl", "text"), default="jsonl")
+
+    watch_all_parser = subparsers.add_parser(
+        "watch-all",
+        help="stream events for matching detached runs for the lifetime of the host session",
+    )
+    watch_all_parser.add_argument("--cwd", default=".")
+    watch_all_parser.add_argument("--session-key")
+    watch_all_parser.add_argument("--poll", type=float, default=0.5)
+    watch_all_parser.add_argument("--format", choices=("jsonl", "text"), default="jsonl")
 
     for name in ("status", "wait", "collect", "tail", "cancel"):
         item = subparsers.add_parser(name)
@@ -1338,6 +1685,8 @@ def command_start(ns: argparse.Namespace) -> int:
     roles, context, root, cli, capabilities, _ = prepare_invocation(ns)
     writer_ids = set(ns.writer)
     validate_write_authority(roles, writer_ids)
+    if ns.heartbeat_seconds <= 0:
+        raise UsageError("--heartbeat-seconds must be positive")
     notice = emit_agent_mode_notice(
         roles,
         writer_ids,
@@ -1356,6 +1705,7 @@ def command_start(ns: argparse.Namespace) -> int:
         "resume": not ns.no_resume,
         "session_key": derive_session_key(ns.session_key),
         "require_login_auth": not ns.allow_non_login_auth,
+        "heartbeat_seconds": float(ns.heartbeat_seconds),
         "warnings": [notice] if notice else [],
     }
     copy_background_inputs(run_dir, roles, context, config)
@@ -1372,16 +1722,22 @@ def command_start(ns: argparse.Namespace) -> int:
         )
     except OSError as exc:
         log_handle.close()
-        update_run_state(
-            run_dir,
-            lambda state: state.update(
+
+        def fail(state: dict[str, Any]) -> None:
+            state.update(
                 {
                     "status": "failed",
                     "finished_at": utc_now(),
                     "exit_code": 1,
                     "supervisor_error": f"failed to launch supervisor: {exc}",
                 }
-            ),
+            )
+
+        record_run_event(
+            run_dir,
+            "run_failed",
+            fail,
+            {"reason": f"failed to launch supervisor: {exc}"},
         )
         raise UsageError(f"failed to launch background supervisor: {exc}") from exc
     finally:
@@ -1393,8 +1749,29 @@ def command_start(ns: argparse.Namespace) -> int:
             state["pid"] = proc.pid
 
     update_run_state(run_dir, record_pid)
+    watch_command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "watch",
+        run_id,
+        "--format",
+        "jsonl",
+    ]
     if ns.json:
-        print(json.dumps({"run_id": run_id, "status": "queued", "run_dir": str(run_dir)}))
+        print(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "status": "queued",
+                    "run_dir": str(run_dir),
+                    "events_path": str(run_dir / "events.ndjson"),
+                    "event_schema": EVENT_SCHEMA,
+                    "heartbeat_seconds": float(ns.heartbeat_seconds),
+                    "watch_command": watch_command,
+                },
+                sort_keys=True,
+            )
+        )
     else:
         print(run_id)
     return 0
@@ -1402,26 +1779,16 @@ def command_start(ns: argparse.Namespace) -> int:
 
 def command_status(ns: argparse.Namespace) -> int:
     run_dir = run_dir_for(ns.run_id)
-    state = load_run_state(run_dir)
-    pid = state.get("pid")
-    if state.get("status") in {"queued", "running"} and not process_is_alive(pid):
-        state = update_run_state(
-            run_dir,
-            lambda current: current.update(
-                {
-                    "status": "failed",
-                    "finished_at": current.get("finished_at") or utc_now(),
-                    "exit_code": 1,
-                    "supervisor_error": current.get("supervisor_error")
-                    or "supervisor process is no longer alive",
-                    "pid": None,
-                }
-            ),
-        )
+    state = ensure_terminal_event(run_dir, reconcile_run_liveness(run_dir))
     if ns.json:
         print(json.dumps(state, indent=2, sort_keys=True))
     else:
         print(f"{state.get('run_id', ns.run_id)}\t{state.get('status', 'unknown')}")
+        print(
+            f"  heartbeat={state.get('heartbeat_seconds', 'unknown')}s"
+            f"\tlast={state.get('last_heartbeat_at') or 'not-yet'}"
+            f"\tevent={state.get('event_sequence', 0)}"
+        )
         for warning in state.get("warnings", []):
             print(f"  {warning}")
         for role in state.get("roles", []):
@@ -1436,27 +1803,82 @@ def command_wait(ns: argparse.Namespace) -> int:
         raise UsageError("--poll must be positive")
     run_dir = run_dir_for(ns.run_id)
     while True:
-        state = load_run_state(run_dir)
+        state = ensure_terminal_event(run_dir, reconcile_run_liveness(run_dir))
         status = str(state.get("status", "unknown"))
         if status in TERMINAL_RUN_STATUSES:
             print(status)
             return exit_code_for_status(status)
-        pid = state.get("pid")
-        if status in {"queued", "running"} and not process_is_alive(pid):
-            state = update_run_state(
-                run_dir,
-                lambda current: current.update(
-                    {
-                        "status": "failed",
-                        "finished_at": utc_now(),
-                        "exit_code": 1,
-                        "supervisor_error": "supervisor process is no longer alive",
-                        "pid": None,
-                    }
-                ),
-            )
-            print("failed")
-            return 1
+        time.sleep(ns.poll)
+
+
+def command_watch(ns: argparse.Namespace) -> int:
+    if ns.poll <= 0:
+        raise UsageError("--poll must be positive")
+    if ns.after_sequence < 0:
+        raise UsageError("--after-sequence must not be negative")
+    run_dir = run_dir_for(ns.run_id)
+    events_path = run_dir / "events.ndjson"
+    offset = 0
+    terminal_seen = False
+    while True:
+        state = ensure_terminal_event(run_dir, reconcile_run_liveness(run_dir))
+        offset, saw_terminal = stream_new_events(
+            events_path,
+            offset,
+            ns.after_sequence,
+            ns.format,
+        )
+        terminal_seen = terminal_seen or saw_terminal
+        if terminal_seen:
+            return 0
+        if state.get("status") in TERMINAL_RUN_STATUSES:
+            if int(state.get("event_sequence", 0)) <= ns.after_sequence:
+                return 0
+            # ensure_terminal_event may have appended after the read above.
+            time.sleep(ns.poll)
+            continue
+        time.sleep(ns.poll)
+
+
+def command_watch_all(ns: argparse.Namespace) -> int:
+    if ns.poll <= 0:
+        raise UsageError("--poll must be positive")
+    target_root = str(project_root(Path(ns.cwd)))
+    target_session = ns.session_key
+    offsets: dict[Path, int] = {}
+
+    while True:
+        root = runs_root()
+        if root.exists():
+            for run_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+                try:
+                    config = load_json(run_dir / "config.json")
+                    ensure_terminal_event(
+                        run_dir,
+                        reconcile_run_liveness(run_dir),
+                    )
+                except (UsageError, OSError, ValueError):
+                    continue
+                if not isinstance(config, dict):
+                    continue
+                if str(config.get("project_root")) != target_root:
+                    continue
+                if target_session and str(config.get("session_key")) != target_session:
+                    continue
+
+                # Replay matching runs from sequence 1. A monitor can start a few
+                # milliseconds after a very fast run completes; filtering by the
+                # monitor's own start time would lose that terminal notification.
+                # Consumers deduplicate with the stable (run_id, sequence) pair.
+                offsets.setdefault(run_dir, 0)
+
+                new_offset, _ = stream_new_events(
+                    run_dir / "events.ndjson",
+                    offsets[run_dir],
+                    0,
+                    ns.format,
+                )
+                offsets[run_dir] = new_offset
         time.sleep(ns.poll)
 
 
@@ -1476,11 +1898,11 @@ def command_tail(ns: argparse.Namespace) -> int:
     if ns.poll <= 0:
         raise UsageError("--poll must be positive")
     run_dir = run_dir_for(ns.run_id)
-    files = [run_dir / "supervisor.log"]
+    files = [run_dir / "events.ndjson", run_dir / "supervisor.log"]
     files.extend(sorted((run_dir / "roles").glob("*")) if (run_dir / "roles").exists() else [])
     offsets: dict[Path, int] = {}
     while True:
-        current_files = [run_dir / "supervisor.log"]
+        current_files = [run_dir / "events.ndjson", run_dir / "supervisor.log"]
         if (run_dir / "roles").exists():
             current_files.extend(sorted((run_dir / "roles").glob("*")))
         for path in current_files:
@@ -1513,17 +1935,20 @@ def command_cancel(ns: argparse.Namespace) -> int:
         return exit_code_for_status(str(status))
     pid = state.get("pid")
     if not isinstance(pid, int) or not process_is_alive(pid):
-        update_run_state(
-            run_dir,
-            lambda current: current.update(
+        def cancel(current: dict[str, Any]) -> None:
+            current.update(
                 {
                     "status": "cancelled",
                     "finished_at": utc_now(),
                     "exit_code": 130,
                     "pid": None,
                 }
-            ),
-        )
+            )
+            for role_state in current.get("roles", []):
+                if role_state.get("status") in {"queued", "running"}:
+                    role_state["status"] = "cancelled"
+
+        record_run_event(run_dir, "run_cancelled", cancel)
         print("cancelled")
         return 130
     try:
@@ -1547,6 +1972,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return command_start(ns)
         if ns.command == "status":
             return command_status(ns)
+        if ns.command == "watch":
+            return command_watch(ns)
+        if ns.command == "watch-all":
+            return command_watch_all(ns)
         if ns.command == "wait":
             return command_wait(ns)
         if ns.command == "collect":

@@ -124,6 +124,7 @@ class CursorCultUnitTests(unittest.TestCase):
                             "label": "Whatever the user requested",
                             "instruction": ["Answer one exact question.", "Cite evidence."],
                             "mode": "ask",
+                            "mode_reason": "The role only gathers evidence.",
                         }
                     ]
                 )
@@ -131,6 +132,10 @@ class CursorCultUnitTests(unittest.TestCase):
             roles = M.parse_roles(path)
             self.assertEqual(roles[0].id, "user-requested-lens")
             self.assertIn("Cite evidence", roles[0].instruction)
+            self.assertEqual(
+                roles[0].mode_reason,
+                "The role only gathers evidence.",
+            )
 
     def test_duplicate_role_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -530,6 +535,123 @@ class CursorCultIntegrationTests(unittest.TestCase):
         self.assertIn("background-ask|force=1|trust=1|mode=ask", trace)
         self.assertIn("background-plan|force=1|trust=1|mode=plan", trace)
         self.assertIn("background-writer|force=1|trust=1|mode=|", trace)
+
+
+    def test_background_watchdog_emits_heartbeat_and_completion(self) -> None:
+        self.fixture.write_roles(
+            [
+                {
+                    "id": "watchdog-lens",
+                    "label": "Watchdog",
+                    "instruction": "Inspect slowly",
+                    "mode": "ask",
+                    "mode_reason": "Read-only evidence collection.",
+                }
+            ]
+        )
+        started = self.run_cli(
+            *self.fixture.command(
+                "start",
+                "--json",
+                "--heartbeat-seconds",
+                "0.10",
+            ),
+            env=self.fixture.env(
+                FAKE_CURSOR_SLEEP_ROLES="watchdog-lens",
+                FAKE_CURSOR_SLEEP_SECS="0.35",
+            ),
+        )
+        self.assertEqual(started.returncode, 0, started.stderr)
+        launch = json.loads(started.stdout)
+        self.assertEqual(launch["event_schema"], M.EVENT_SCHEMA)
+        self.assertEqual(launch["heartbeat_seconds"], 0.10)
+        self.assertEqual(launch["watch_command"][-3:], [launch["run_id"], "--format", "jsonl"])
+
+        watched = self.run_cli(
+            sys.executable,
+            str(RUNNER),
+            "watch",
+            launch["run_id"],
+            "--poll",
+            "0.02",
+            env=self.fixture.env(),
+            timeout=10,
+        )
+        self.assertEqual(watched.returncode, 0, watched.stderr)
+        events = [json.loads(line) for line in watched.stdout.splitlines() if line.strip()]
+        event_names = [event["event"] for event in events]
+        self.assertIn("heartbeat", event_names)
+        self.assertEqual(event_names[-1], "run_completed")
+        sequences = [event["sequence"] for event in events]
+        self.assertEqual(sequences, sorted(set(sequences)))
+        heartbeat = next(event for event in events if event["event"] == "heartbeat")
+        self.assertEqual(heartbeat["details"]["heartbeat_seconds"], 0.10)
+        self.assertIn("still running", heartbeat["message"])
+        terminal = events[-1]
+        self.assertEqual(terminal["status"], "succeeded")
+        self.assertTrue(Path(terminal["details"]["report_markdown"]).exists())
+
+        state = json.loads(Path(launch["run_dir"]).joinpath("state.json").read_text())
+        self.assertIsNotNone(state["last_heartbeat_at"])
+        self.assertEqual(state["last_event_type"], "run_completed")
+        self.assertEqual(state["roles"][0]["mode_reason"], "Read-only evidence collection.")
+
+    def test_watch_after_sequence_replays_only_newer_events(self) -> None:
+        self.fixture.write_roles([{"id": "quick", "label": "Quick", "instruction": "Inspect"}])
+        started = self.run_cli(*self.fixture.command("start", "--json"))
+        self.assertEqual(started.returncode, 0, started.stderr)
+        launch = json.loads(started.stdout)
+        wait = self.run_cli(
+            sys.executable,
+            str(RUNNER),
+            "wait",
+            launch["run_id"],
+            "--poll",
+            "0.02",
+            env=self.fixture.env(),
+        )
+        self.assertEqual(wait.returncode, 0, wait.stderr)
+        all_events = [
+            json.loads(line)
+            for line in Path(launch["events_path"]).read_text().splitlines()
+            if line.strip()
+        ]
+        cutoff = all_events[-2]["sequence"]
+        watched = self.run_cli(
+            sys.executable,
+            str(RUNNER),
+            "watch",
+            launch["run_id"],
+            "--after-sequence",
+            str(cutoff),
+            "--poll",
+            "0.02",
+            env=self.fixture.env(),
+        )
+        replay = [json.loads(line) for line in watched.stdout.splitlines() if line.strip()]
+        self.assertEqual([event["sequence"] for event in replay], [all_events[-1]["sequence"]])
+        self.assertEqual(replay[0]["event"], "run_completed")
+
+    def test_all_role_failure_emits_run_failed_terminal_event(self) -> None:
+        self.fixture.write_roles(
+            [{"id": "doomed", "label": "Doomed", "instruction": "Fail"}]
+        )
+        started = self.run_cli(
+            *self.fixture.command("start", "--heartbeat-seconds", "0.05", "--json"),
+            env=self.fixture.env(FAKE_CURSOR_FAIL_ROLES="doomed"),
+        )
+        self.assertEqual(started.returncode, 0, started.stderr)
+        launch = json.loads(started.stdout)
+        watched = self.run_cli(
+            *launch["watch_command"],
+            "--poll",
+            "0.02",
+            env=self.fixture.env(FAKE_CURSOR_FAIL_ROLES="doomed"),
+        )
+        self.assertEqual(watched.returncode, 0, watched.stderr)
+        events = [json.loads(line) for line in watched.stdout.splitlines() if line.strip()]
+        self.assertEqual(events[-1]["event"], "run_failed")
+        self.assertEqual(events[-1]["status"], "failed")
 
     def test_background_cancel_terminates_worker(self) -> None:
         self.fixture.write_roles([{"id": "slow-lens", "label": "Slow", "instruction": "Inspect slowly"}])
