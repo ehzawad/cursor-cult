@@ -1,12 +1,20 @@
 {
   "name": "cursor-cult",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Dynamic, host-composed Cursor CLI worker fleets for Codex.",
-  "author": {"name": "ehzawad"},
+  "author": {
+    "name": "ehzawad"
+  },
   "homepage": "https://github.com/ehzawad/cursor-cult",
   "repository": "https://github.com/ehzawad/cursor-cult",
   "license": "MIT",
-  "keywords": ["cursor", "codex", "agents", "dynamic-roles", "orchestration"],
+  "keywords": [
+    "cursor",
+    "codex",
+    "agents",
+    "dynamic-roles",
+    "orchestration"
+  ],
   "skills": "./codex-skills/",
   "interface": {
     "displayName": "Cursor Cult",
@@ -14,8 +22,14 @@
     "longDescription": "Codex preserves the user's intent, synthesizes task-specific roles from the live workspace, conducts browser-authenticated Cursor CLI workers, and reconciles their evidence.",
     "developerName": "ehzawad",
     "category": "Developer Tools",
-    "capabilities": ["Interactive", "Read", "Write"],
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
     "websiteURL": "https://github.com/ehzawad/cursor-cult",
-    "defaultPrompt": ["Use Cursor Cult to investigate this task with dynamically composed Cursor CLI workers"]
+    "defaultPrompt": [
+      "Use Cursor Cult to investigate this task with dynamically composed Cursor CLI workers"
+    ]
   }
 }

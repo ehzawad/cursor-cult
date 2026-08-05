@@ -517,6 +517,126 @@ class CursorCultUnitTests(unittest.TestCase):
             self.assertEqual(M.journal_size(ancient), (ancient / "events.ndjson").stat().st_size)
             self.assertEqual(M.journal_size(Path(tmp) / "missing"), 0)
 
+    def test_read_only_role_config_denies_writes_and_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": tmp}):
+                root = Path(tmp) / "proj"
+                reader = M.write_role_cursor_config(
+                    M.role_config_dir(root, "k", "reader"), allow_edit=False, allow_shell=False
+                )
+                shelly = M.write_role_cursor_config(
+                    M.role_config_dir(root, "k", "shelly"), allow_edit=False, allow_shell=True
+                )
+                writer = M.write_role_cursor_config(
+                    M.role_config_dir(root, "k", "writer"), allow_edit=True, allow_shell=False
+                )
+
+                def deny(path: Path) -> list[str]:
+                    return json.loads((path / "cli-config.json").read_text())["permissions"]["deny"]
+
+                self.assertIn("Write(**)", deny(reader))
+                self.assertIn("Shell(*)", deny(reader), "shell is a write vector")
+                self.assertIn("Write(**)", deny(shelly))
+                self.assertNotIn("Shell(*)", deny(shelly), "--readonly-shell must relax shell")
+                self.assertNotIn("Write(**)", deny(writer), "the authorized writer must still write")
+                # Self-protection uses the resolved path, or it silently matches nothing.
+                self.assertTrue(
+                    any(r.startswith(f"Write({os.path.realpath(reader)}") for r in deny(reader)),
+                    deny(reader),
+                )
+                # Credentials are never copied into run state.
+                self.assertNotIn(
+                    "authInfo", json.loads((reader / "cli-config.json").read_text())
+                )
+                # The config dir is stable, so the CLI's chats/ store survives for --resume.
+                self.assertEqual(reader, M.role_config_dir(root, "k", "reader"))
+                for path in (reader.parent, reader):
+                    self.assertEqual(path.stat().st_mode & 0o077, 0, str(path))
+
+    def test_env_never_leaks_an_inherited_cursor_config_dir(self) -> None:
+        with mock.patch.dict(os.environ, {"CURSOR_CONFIG_DIR": "/tmp/attacker"}):
+            self.assertNotIn("CURSOR_CONFIG_DIR", M.sanitized_cursor_env())
+            self.assertEqual(
+                M.sanitized_cursor_env(Path("/tmp/mine"))["CURSOR_CONFIG_DIR"], "/tmp/mine"
+            )
+
+    def test_torn_journal_tail_is_repaired_not_compounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            M.atomic_write_json(
+                run_dir / "state.json",
+                {"run_id": "r", "status": "running", "created_at": M.utc_now(),
+                 "event_sequence": 2, "roles": []},
+            )
+            journal = run_dir / "events.ndjson"
+            M.append_event_line(
+                journal, {"schema": M.EVENT_SCHEMA, "sequence": 1, "run_id": "r", "event": "run_started"}
+            )
+            torn = json.dumps({"schema": M.EVENT_SCHEMA, "sequence": 2, "run_id": "r",
+                               "event": "run_completed"}, sort_keys=True)
+            with journal.open("a") as handle:
+                handle.write(torn[: len(torn) // 2])
+
+            def finish(state: dict) -> None:
+                state.update({"status": "succeeded", "finished_at": M.utc_now()})
+
+            M.record_run_event(run_dir, "run_completed", finish, {"outcome": "succeeded"})
+            events = [json.loads(line) for line in journal.read_text().splitlines()]
+            sequences = [e["sequence"] for e in events]
+            self.assertEqual(len(sequences), len(set(sequences)), "no reused sequence")
+            self.assertTrue(
+                any(e["event"] in M.TERMINAL_EVENT_TYPES for e in events),
+                "a torn tail must not swallow the terminal record",
+            )
+
+    def test_supervisor_lock_tracks_liveness_not_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            self.assertEqual(M.supervisor_lock_state(run_dir), "absent")
+            held = M.open_owner_lock(run_dir)
+            self.assertIsNotNone(held)
+            self.assertEqual(M.supervisor_lock_state(run_dir), "held")
+            # A pid that is certainly dead must not make a locked run look dead.
+            self.assertTrue(M.supervisor_is_alive(run_dir, 2**22))
+            assert held is not None
+            held.close()
+            self.assertEqual(M.supervisor_lock_state(run_dir), "free")
+            self.assertFalse(M.supervisor_is_alive(run_dir, os.getpid()))
+
+    def test_prune_refuses_live_recent_and_kept_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": tmp}):
+                root = M.runs_root()
+
+                def make(name: str, status: str, age_hours: float) -> Path:
+                    run_dir = root / name
+                    run_dir.mkdir(parents=True)
+                    when = M.dt.datetime.now(M.dt.timezone.utc) - M.dt.timedelta(hours=age_hours)
+                    M.atomic_write_json(run_dir / "config.json", {"project_root": "/p"})
+                    M.atomic_write_json(
+                        run_dir / "state.json",
+                        {"run_id": name, "status": status,
+                         "finished_at": when.isoformat().replace("+00:00", "Z")},
+                    )
+                    return run_dir
+
+                make("old-done", "succeeded", 100)
+                make("recent-done", "succeeded", 0.1)
+                make("still-running", "running", 100)
+                live = make("live-lock", "succeeded", 100)
+                handle = M.open_owner_lock(live)
+                self.addCleanup(lambda: handle and handle.close())
+
+                removed = M.prune_runs("/p", max_age_seconds=3600, keep=0, dry_run=True)
+                self.assertEqual(removed, ["old-done"])
+                self.assertNotIn("live-lock", removed, "a held supervisor lock vetoes deletion")
+                self.assertEqual(
+                    M.prune_runs("/p", max_age_seconds=3600, keep=5, dry_run=True),
+                    [],
+                    "--keep retains the newest finished runs",
+                )
+
     def test_event_journal_is_not_world_readable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run"
