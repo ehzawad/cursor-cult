@@ -79,7 +79,7 @@ Or explicitly provide desired lenses:
 /cursor-cult:cursor-cult use one PostgreSQL locking lens, one distributed-systems adversary, and one minimal-migration lens; then implement only after reconciling them
 ```
 
-Claude Code passes everything after the skill name through `$ARGUMENTS`. The skill uses `${CLAUDE_SKILL_DIR}` to locate its bundled runner and `${CLAUDE_SESSION_ID}` to isolate resumable Cursor threads.
+Claude Code passes everything after the skill name through `$ARGUMENTS`, and the skill uses `${CLAUDE_SKILL_DIR}` to locate its bundled runner. Resumable Cursor threads are scoped by a host-session key derived from the first of `CURSOR_CULT_SESSION_KEY`, `CLAUDE_CODE_REMOTE_SESSION_ID`, `CLAUDE_SESSION_ID`, `CODEX_THREAD_ID`, or a terminal fallback that is present — falling back to the literal `project`, which every session in that project then shares. Set `CURSOR_CULT_SESSION_KEY` explicitly, and identically for the runner and any watcher, whenever session isolation actually matters.
 
 For local plugin development:
 
@@ -202,9 +202,15 @@ Read-only workers receive an explicit no-mutation contract. A single role can be
 cursor-cult run ... --writer exact-role-id
 ```
 
-Write authority comes from Cursor's agent mode, not from `--force`. Workers are non-interactive, so `--trust`, `--approve-mcps`, and `--force` are passed to every role — an unanswered prompt would otherwise kill the worker before it produced anything. Those flags suppress prompts; they do not grant edit authority. The two directions are bound together and checked before launch: a role declaring `"mode": "agent"` without `--writer` is rejected, and a `--writer` role that is not in agent mode is rejected rather than running silently read-only.
+Workers are non-interactive, so `--trust`, `--approve-mcps`, and `--force` are passed to every role — an unanswered prompt would otherwise kill the worker before it produced anything. Write authority is *declared* through Cursor's agent mode, and the two directions are bound together and checked before launch: a role declaring `"mode": "agent"` without `--writer` is rejected, and a `--writer` role that is not in agent mode is rejected rather than running silently read-only.
+
+Be precise about what `--force` does, because it is not just a prompt suppressor. Cursor's headless documentation states that you "combine `--print` with `--force` (or `--yolo`) to modify files in scripts" and that "without `--force`, changes are only proposed, not applied" — so in `-p` mode `--force` is the flag that makes edits real. Read-only roles are held read-only by `--mode` alone, and Cursor does not document whether an explicit `ask`/`plan` mode outranks `--force`. Treat that precedence as an external dependency on your installed Cursor CLI rather than a guarantee this runner enforces, and verify it before pointing a fleet at a worktree you cannot afford to have modified.
+
+For hard enforcement Cursor's own recommendation is a permission configuration with explicit `allow`/`deny` rules, which it advises for exactly this restricted-autonomy case. Cursor Cult does not yet emit one, so `--force`'s "allow unless explicitly denied" currently runs with nothing denied. Supplying a deny list, and adopting Cursor's first-party `--worktree` isolation instead of asking hosts to arrange isolated worktrees by hand, are the intended next steps.
 
 Cursor accepts only `ask` and `plan` as explicit `--mode` values in this CLI interface. Agent mode remains fully supported: Cursor Cult selects Cursor's default agent behavior by omitting `--mode`, never by passing the invalid `--mode agent`. A fleet may mix `ask`, `plan`, and one authorized `agent` writer. Both foreground `run` and detached `start` print a warning naming the agent writer and explaining that it can edit files and run commands; detached run state preserves the same warning.
+
+Because omitting `--mode` *is* how agent mode is selected, a read-only role can only be held read-only when the CLI advertises `--mode`. Capability detection reads `cursor-agent --help`, so a probe that times out, fails, or returns nothing would otherwise drop `--mode` while still passing `--force` — launching an `ask` role with argv identical to an authorized writer. Cursor Cult fails closed instead: if `--mode` was not positively detected, every `ask` and `plan` role is refused before launch with exit `2`.
 
 The writer may mutate the local worktree within the Intent Capsule, but it may not commit, push, open or merge a PR, deploy, publish, or mutate external services unless the capsule explicitly authorizes that exact action.
 
@@ -248,14 +254,16 @@ LAUNCH="$(python3 scripts/cursor_cult.py start --json \
   --session-key "manual:example")"
 ```
 
-Each detached supervisor writes `cursor-cult.event.v1` JSONL records for queueing, run start, role start/finish, heartbeats, completion, failure, and cancellation. The default heartbeat interval is exactly `540` seconds (nine minutes). It is persisted in run state and can be changed for tests or operations with `--heartbeat-seconds` or `CURSOR_CULT_HEARTBEAT_SECONDS`.
+Each detached supervisor writes `cursor-cult.event.v1` JSONL records for queueing, run start, role start/finish, heartbeats, completion, failure, and cancellation. The heartbeat interval defaults to `540` seconds (nine minutes). It is a scheduling cadence rather than a delivery deadline — lock waits, filesystem latency, host suspension, and watcher polling all delay observation, and a run shorter than one interval emits no heartbeat at all. It is persisted in run state and can be changed for tests or operations with `--heartbeat-seconds` or `CURSOR_CULT_HEARTBEAT_SECONDS`.
 
 ```zsh
 python3 scripts/cursor_cult.py watch <run-id>
 python3 scripts/cursor_cult.py watch <run-id> --after-sequence 12
 ```
 
-`watch` replays and follows one journal, flushes every event immediately, and exits after the terminal event. Claude Code plugin installs include a session monitor that starts on the first skill invocation and delivers every watchdog line to the live Claude harness when Claude Code is v2.1.105 or later, the session is interactive, and the experimental Monitor facility is available. Codex hosts attach the returned `watch_command` to a Codex-managed background terminal so output deltas and process completion return to the main harness. Manual recovery remains available through `status`, `tail`, `wait`, `collect`, and `cancel`.
+`watch` replays and follows one journal, flushes each event as it is read, and exits after the terminal event — or, if the run is already terminal and has nothing left to deliver, after one drain pass, so it never polls a finished run forever.
+
+Notification delivery is a host capability, not something this runner provides. `start` returns a durable run and an exact `watch_command`; that command is inert until a host launches it. The packaged Claude Code plugin ships a `watch-all` monitor definition, which delivers watcher lines into a live session only where Claude Code registers and starts plugin monitors. For Codex, the skill instructs the host to attach `watch_command` to a managed background terminal; nothing in this repository performs that attachment, and a host without such a channel gets no push notification. On any unsupported, headless, or monitor-disabled host, confirm the watcher actually started before reporting that notifications are active — otherwise keep `watch`/`wait` attached, or retain the run ID and poll `status`, `tail`, `wait`, `collect`, and `cancel` manually.
 
 ## Explicit detached execution
 
@@ -341,11 +349,11 @@ The test suite uses a fake Cursor CLI; it does not consume Cursor quota.
 
 ## Primary references
 
-- [Cursor CLI overview](https://docs.cursor.com/en/cli/overview)
-- [Cursor CLI parameters](https://docs.cursor.com/en/cli/reference/parameters)
-- [Cursor CLI output format](https://docs.cursor.com/en/cli/reference/output-format)
-- [Cursor CLI authentication](https://docs.cursor.com/en/cli/reference/authentication)
-- [Cursor headless mode](https://docs.cursor.com/en/cli/headless)
+- [Cursor CLI overview](https://cursor.com/docs/cli/overview)
+- [Cursor CLI parameters](https://cursor.com/docs/cli/reference/parameters)
+- [Cursor CLI output format](https://cursor.com/docs/cli/reference/output-format)
+- [Cursor CLI authentication](https://cursor.com/docs/cli/reference/authentication)
+- [Cursor headless mode](https://cursor.com/docs/cli/headless)
 - [OpenAI: Build skills](https://developers.openai.com/codex/skills)
 - [OpenAI: Package plugins](https://developers.openai.com/codex/plugins/build)
 - [Claude Code: Create plugins](https://code.claude.com/docs/en/plugins)

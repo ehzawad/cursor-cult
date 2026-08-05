@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.0 — 2026-08-05
+
+- Add the public `cursor-cult.event.v1` JSONL journal for detached runs, with per-run sequence numbers, role lifecycle records, configurable heartbeats, and terminal outcome events.
+- Add `watch <run-id>` to replay and follow one run, and `watch-all` for long-lived project/session monitoring. `start --json` now returns the run directory, event path, schema, configured heartbeat interval, and an exact watcher argv.
+- Add best-effort detached-run liveness reconciliation for dead or never-published supervisor PIDs, and recovery of a wholly absent terminal journal record from terminal state.
+- Add a host-owned mode-selection contract for choosing `ask`, `plan`, or authorized `agent` per role, an optional per-role `mode_reason` surfaced by `check`, detached state, and event records, and a warning before foreground or detached execution of an authorized agent-mode writer. This builds on 0.4.1, which already fixed the invalid `--mode agent` argv mapping and bound agent mode to `--writer`.
+- Fix read-only roles failing open to agent mode when Cursor CLI capability detection failed. `supports_mode` is the only capability without a permissive empty-help fallback, so a `--help` probe that timed out, raised, or returned nothing dropped `--mode` while still passing `--trust`, `--approve-mcps`, and `--force` — launching an `ask` or `plan` role with argv identical to an authorized writer. Read-only roles are now refused before launch when `--mode` was not positively detected.
+- Fix every `role_started` and `role_completed` event losing its `mode`, `role_status`, `duration_ms`, and `error`. `record_run_event` snapshotted the caller's `details` before running the `mutate` closure that populates it, so role events carried only `role_id` and every completion message read "status unknown". The snapshot now happens after the mutation.
+- Fix an unusable `CURSOR_CULT_HEARTBEAT_SECONDS` crashing every subcommand. The value was parsed eagerly as an argparse default inside `build_parser()`, which runs for all commands, so `export CURSOR_CULT_HEARTBEAT_SECONDS=` raised an unhandled `ValueError` from `--version`, `--help`, `watch`, and the packaged plugin monitor alike. An unusable value now falls back to the default; an explicit non-positive `--heartbeat-seconds` is still rejected.
+- Fix a watcher permanently losing an event when it observed a partially appended journal line. The reader advanced its offset past the newline-less fragment, then read the remainder as a second unparseable fragment. Offsets are now committed only for newline-terminated records.
+- Fix `events.ndjson` being the one run-state file created under the ambient umask rather than `0600`, despite carrying the same worker output and error text as the rest of the run directory.
+- Emit report paths on the recovered, cancelled, and liveness-failure terminal events, not only the supervisor's own, so a host reacting to any terminal event knows where to collect from. Reconciled-failed runs now also sweep role states out of `queued`/`running`, and a successful terminal state no longer keeps a stale `supervisor_error`.
+- Fix `watch` spinning forever when a run is terminal but no terminal event is deliverable to that watcher, such as when the terminal sequence is at or below `--after-sequence` or the journal tail is inconsistent. `watch` now exits after one post-terminal drain pass.
+- Fix a supervisor that lost the startup-grace race resurrecting a run already reconciled to `failed`. Terminal status is now absorbing: such a supervisor exits instead of flipping the run back to `running` and appending post-terminal lifecycle events.
+- Fix `watch-all` reconciling and appending recovery events for every run under the state root before applying its project and session filters, so one project's monitor mutated other projects' runs.
+- Package a Claude Code `watch-all` monitor definition and document how supported Claude Code and Codex hosts can attach watcher output. Notification availability depends on the host facility and is not guaranteed by this runner.
+- Extend package synchronization checks and CI manifest validation to cover the monitor files.
+
 ## 0.4.1 — 2026-08-04
 
 - Fix Codex never surfacing the skill. `codex plugin marketplace add` only makes a plugin *available*; the README omitted the required `codex plugin add cursor-cult@cursor-cult`, so the plugin stayed `not installed` and its skill never loaded. Both steps are now documented with a verification command.

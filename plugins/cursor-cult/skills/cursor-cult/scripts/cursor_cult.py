@@ -43,6 +43,7 @@ AGENT_MODE_EXPLANATION = (
     "Cursor CLI agent mode is selected by omitting `--mode`; this CLI version "
     "accepts only `ask` and `plan` as explicit `--mode` values."
 )
+READ_ONLY_MODES = ("ask", "plan")
 EVENT_SCHEMA = "cursor-cult.event.v1"
 DEFAULT_HEARTBEAT_SECONDS = 9 * 60
 SUPERVISOR_START_GRACE_SECONDS = 10
@@ -554,8 +555,16 @@ def build_cursor_args(
     args = [cli, "-p", "--output-format", "stream-json"]
     # A fleet worker has no terminal, so every interactive gate must be pre-answered:
     # an unanswered workspace-trust, MCP-approval, or command-approval prompt exits 1
-    # with no result event. These bypass prompts, not the read-only contract — that is
-    # enforced by --mode below, which the Cursor agent honors independently of --force.
+    # with no result event.
+    #
+    # `--force` is NOT merely a prompt suppressor. Cursor's headless documentation is
+    # explicit that "without --force, changes are only proposed, not applied", so in
+    # `-p` mode it is the flag that makes edits real. Read-only roles are therefore
+    # held read-only by `--mode` alone, and Cursor does not document whether an
+    # explicit `ask`/`plan` mode outranks `--force`. Treat that precedence as an
+    # unverified external dependency, not a guarantee enforced here — which is why
+    # validate_read_only_capability() refuses to launch a read-only role at all when
+    # `--mode` was not positively detected.
     if capabilities.supports_trust:
         args.append("--trust")
     if capabilities.supports_approve_mcps:
@@ -918,6 +927,31 @@ def validate_write_authority(roles: Sequence[Role], writer_ids: set[str]) -> Non
         )
 
 
+def validate_read_only_capability(
+    roles: Sequence[Role], capabilities: CursorCapabilities
+) -> None:
+    """Refuse to launch read-only roles that cannot be pinned to an explicit mode.
+
+    `--mode` is the only mechanism that holds an `ask`/`plan` role read-only, and it
+    is emitted solely when the CLI advertises the flag. Detection fails to False when
+    the `--help` probe times out, raises, or returns nothing, while every other
+    capability defaults permissive — so failing open here would silently launch a
+    read-only role in Cursor's default agent mode carrying `--force`, identical to an
+    authorized writer. Fail closed instead: no mode flag, no read-only role.
+    """
+    if capabilities.supports_mode:
+        return
+    blocked = sorted(role.id for role in roles if role.mode in READ_ONLY_MODES)
+    if not blocked:
+        return
+    raise UsageError(
+        "Cursor CLI did not advertise --mode, so read-only roles cannot be pinned to "
+        f"{' or '.join(READ_ONLY_MODES)} and would run in agent mode: "
+        + ", ".join(blocked)
+        + ". Verify `cursor-agent --help` succeeds and lists --mode."
+    )
+
+
 def agent_mode_notice(
     roles: Sequence[Role],
     writer_ids: set[str],
@@ -970,6 +1004,7 @@ async def execute_fleet(
     # 0 (the default) means uncapped: every requested role runs concurrently.
     effective_max_parallel = max_parallel if max_parallel > 0 else max(len(roles), 1)
     validate_write_authority(roles, writer_ids)
+    validate_read_only_capability(roles, capabilities)
 
     if role_log_dir is not None:
         role_log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1128,7 +1163,14 @@ def event_message(
 
 def append_event_line(path: Path, event: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    existed = path.exists()
     with path.open("a", encoding="utf-8") as handle:
+        # Every other run-state file is written 0600 through atomic_write_text; a bare
+        # open() would instead leave the journal at 0666 & ~umask, and it carries the
+        # same worker output and error text as the rest of the run directory.
+        if not existed:
+            with contextlib.suppress(OSError):
+                os.fchmod(handle.fileno(), 0o600)
         handle.write(json.dumps(event, sort_keys=True) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
@@ -1156,7 +1198,6 @@ def record_run_event(
     mutate: Callable[[dict[str, Any]], None] | None = None,
     details: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    details = dict(details or {})
     lock_path = run_dir / ".state.lock"
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     with lock_path.open("a+") as lock_handle:
@@ -1170,6 +1211,12 @@ def record_run_event(
             )
             if mutate is not None:
                 mutate(state)
+            # Snapshot `details` only after `mutate` has run. Callers such as
+            # supervise_run's progress() enrich the very dict they passed in from
+            # inside their mutate closure, so copying beforehand silently dropped
+            # mode, role_status, duration_ms and error from every role event and left
+            # every role_completed message reading "status unknown".
+            details = dict(details or {})
             if (
                 event_type == "heartbeat"
                 and state.get("status") in TERMINAL_RUN_STATUSES
@@ -1206,6 +1253,7 @@ def record_run_event(
                         "id": role.get("id"),
                         "label": role.get("label"),
                         "mode": role.get("mode"),
+                        "mode_reason": role.get("mode_reason"),
                         "status": role.get("status"),
                     }
                     for role in state.get("roles", [])
@@ -1267,12 +1315,21 @@ def reconcile_run_liveness(run_dir: Path) -> dict[str, Any]:
                     "pid": None,
                 }
             )
+            # Sweep role states the way the cancellation paths do, so the terminal
+            # event's summary cannot report roles as still queued/running on a run
+            # that has already failed.
+            for role_state in current.get("roles", []):
+                if isinstance(role_state, dict) and role_state.get("status") in {
+                    "queued",
+                    "running",
+                }:
+                    role_state["status"] = "cancelled"
 
         state, _ = record_run_event(
             run_dir,
             "run_failed",
             fail,
-            {"reason": reason},
+            {"reason": reason, **report_details(run_dir)},
         )
     return state
 
@@ -1290,9 +1347,25 @@ def ensure_terminal_event(run_dir: Path, state: dict[str, Any]) -> dict[str, Any
     state, _ = record_run_event(
         run_dir,
         terminal_event_for_status(status),
-        details={"outcome": status, "recovered": True},
+        details={"outcome": status, "recovered": True, **report_details(run_dir)},
     )
     return state
+
+
+def report_details(run_dir: Path) -> dict[str, Any]:
+    """Report paths for a terminal event, included only when they exist.
+
+    A host reacting to a terminal event needs somewhere to collect from. The
+    supervisor's own terminal event always carries these, but the recovered,
+    cancelled, and liveness-failure paths reached the host without them even when
+    partial reports had already been written to disk.
+    """
+    found: dict[str, Any] = {}
+    for key, name in (("report_markdown", "report.md"), ("report_json", "report.json")):
+        path = run_dir / name
+        if path.exists():
+            found[key] = str(path)
+    return found
 
 
 async def emit_heartbeats(run_dir: Path, heartbeat_seconds: float) -> None:
@@ -1331,6 +1404,14 @@ def stream_new_events(
         while True:
             line = handle.readline()
             if not line:
+                break
+            if not line.endswith("\n"):
+                # An in-progress append: readline() returns a newline-less prefix only
+                # at EOF. Leave `offset` at the start of this record so it is re-read
+                # once the writer finishes it. Committing the advanced offset here
+                # would skip the fragment, then read the remainder as a second
+                # unparseable fragment, losing the event permanently — fatal when the
+                # lost event is the terminal one.
                 break
             offset = handle.tell()
             try:
@@ -1418,9 +1499,25 @@ async def supervise_run(run_dir: Path) -> int:
     registry = ActiveProcessRegistry()
 
     def mark_running(state: dict[str, Any]) -> None:
+        # Terminal is absorbing. A supervisor that lost the startup race — its PID was
+        # not published before SUPERVISOR_START_GRACE_SECONDS elapsed and a watcher
+        # reconciled the run to failed — must not flip that back to running, which
+        # would leave stale finished_at/exit_code/supervisor_error behind and re-open
+        # a run that already delivered its terminal event.
+        if state.get("status") in TERMINAL_RUN_STATUSES:
+            return
         state["status"] = "running"
         state["pid"] = os.getpid()
         state["started_at"] = utc_now()
+
+    startup_state = load_run_state(run_dir)
+    if startup_state.get("status") in TERMINAL_RUN_STATUSES:
+        status = str(startup_state.get("status", "failed"))
+        atomic_write_text(
+            run_dir / "supervisor-error.log",
+            f"run was already reconciled to {status} before this supervisor started\n",
+        )
+        return exit_code_for_status(status)
 
     record_run_event(run_dir, "run_started", mark_running)
 
@@ -1495,6 +1592,11 @@ async def supervise_run(run_dir: Path) -> int:
             state["finished_at"] = utc_now()
             state["exit_code"] = exit_code_for_status(status)
             state["pid"] = None
+            # A supervisor_error left over from an earlier reconciliation attempt
+            # would otherwise survive into a successful terminal state and misreport
+            # the run to anyone reading state.json.
+            if status not in {"failed", "cancelled"}:
+                state.pop("supervisor_error", None)
 
         record_run_event(
             run_dir,
@@ -1519,7 +1621,7 @@ async def supervise_run(run_dir: Path) -> int:
                 if role_state.get("status") in {"queued", "running"}:
                     role_state["status"] = "cancelled"
 
-        record_run_event(run_dir, "run_cancelled", cancel)
+        record_run_event(run_dir, "run_cancelled", cancel, report_details(run_dir))
         return 130
     except Exception as exc:
         atomic_write_text(run_dir / "supervisor-error.log", f"{type(exc).__name__}: {exc}\n")
@@ -1576,6 +1678,25 @@ def add_execution_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--unsafe-staging", action="store_true")
 
 
+def default_heartbeat_seconds() -> float:
+    """Resolve the heartbeat default without letting a bad env var brick the CLI.
+
+    build_parser() runs for *every* subcommand, so parsing this eagerly meant one
+    `export CURSOR_CULT_HEARTBEAT_SECONDS=` (empty is a common shell idiom) raised an
+    unhandled ValueError from `--version`, `--help`, `watch`, and the shipped plugin
+    monitor alike. An unusable value falls back to the default; `start` still rejects
+    a non-positive `--heartbeat-seconds` passed explicitly.
+    """
+    raw = os.environ.get("CURSOR_CULT_HEARTBEAT_SECONDS")
+    if raw is None or not raw.strip():
+        return float(DEFAULT_HEARTBEAT_SECONDS)
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(DEFAULT_HEARTBEAT_SECONDS)
+    return value if value > 0 else float(DEFAULT_HEARTBEAT_SECONDS)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cursor-cult",
@@ -1598,12 +1719,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument(
         "--heartbeat-seconds",
         type=float,
-        default=float(
-            os.environ.get(
-                "CURSOR_CULT_HEARTBEAT_SECONDS",
-                str(DEFAULT_HEARTBEAT_SECONDS),
-            )
-        ),
+        default=default_heartbeat_seconds(),
         help="watchdog heartbeat interval; defaults to 540 seconds (9 minutes)",
     )
 
@@ -1652,6 +1768,7 @@ async def command_run(ns: argparse.Namespace) -> int:
     # report an invalid invocation as a fleet failure instead of exit 2.
     writer_ids = set(ns.writer)
     validate_write_authority(roles, writer_ids)
+    validate_read_only_capability(roles, capabilities)
     emit_agent_mode_notice(roles, writer_ids, execution="foreground run")
     registry = ActiveProcessRegistry()
     loop = asyncio.get_running_loop()
@@ -1708,6 +1825,7 @@ def command_check(ns: argparse.Namespace) -> int:
     roles, context, root, cli, capabilities, status_output = prepare_invocation(ns)
     writer_ids = set(ns.writer)
     validate_write_authority(roles, writer_ids)
+    validate_read_only_capability(roles, capabilities)
     notice = agent_mode_notice(roles, writer_ids, execution="validated fleet")
     payload = {
         "ok": True,
@@ -1730,6 +1848,7 @@ def command_start(ns: argparse.Namespace) -> int:
     roles, context, root, cli, capabilities, _ = prepare_invocation(ns)
     writer_ids = set(ns.writer)
     validate_write_authority(roles, writer_ids)
+    validate_read_only_capability(roles, capabilities)
     if ns.heartbeat_seconds <= 0:
         raise UsageError("--heartbeat-seconds must be positive")
     notice = emit_agent_mode_notice(
@@ -1865,6 +1984,7 @@ def command_watch(ns: argparse.Namespace) -> int:
     events_path = run_dir / "events.ndjson"
     offset = 0
     terminal_seen = False
+    drained_after_terminal = False
     while True:
         state = ensure_terminal_event(run_dir, reconcile_run_liveness(run_dir))
         offset, saw_terminal = stream_new_events(
@@ -1877,11 +1997,16 @@ def command_watch(ns: argparse.Namespace) -> int:
         if terminal_seen:
             return 0
         if state.get("status") in TERMINAL_RUN_STATUSES:
-            if int(state.get("event_sequence", 0)) <= ns.after_sequence:
+            # Terminal state alone is not the exit condition: ensure_terminal_event may
+            # have appended the record after the scan above, so allow exactly one more
+            # drain pass. If that pass still yields no terminal event, the run is over
+            # and its terminal record is simply not deliverable to this watcher — it
+            # was already acknowledged via --after-sequence, or the tail is
+            # inconsistent. Exit either way; a watcher must never spin forever on a
+            # run that has already finished.
+            if drained_after_terminal:
                 return 0
-            # ensure_terminal_event may have appended after the read above.
-            time.sleep(ns.poll)
-            continue
+            drained_after_terminal = True
         time.sleep(ns.poll)
 
 
@@ -1898,10 +2023,6 @@ def command_watch_all(ns: argparse.Namespace) -> int:
             for run_dir in sorted(path for path in root.iterdir() if path.is_dir()):
                 try:
                     config = load_json(run_dir / "config.json")
-                    ensure_terminal_event(
-                        run_dir,
-                        reconcile_run_liveness(run_dir),
-                    )
                 except (UsageError, OSError, ValueError):
                     continue
                 if not isinstance(config, dict):
@@ -1909,6 +2030,14 @@ def command_watch_all(ns: argparse.Namespace) -> int:
                 if str(config.get("project_root")) != target_root:
                     continue
                 if target_session and str(config.get("session_key")) != target_session:
+                    continue
+
+                # Reconcile only runs this watcher owns. Doing it before the filters
+                # would let one project's monitor mutate state and append recovery
+                # events for every other project's and session's runs.
+                try:
+                    ensure_terminal_event(run_dir, reconcile_run_liveness(run_dir))
+                except (UsageError, OSError, ValueError):
                     continue
 
                 # Replay matching runs from sequence 1. A monitor can start a few
@@ -1993,7 +2122,7 @@ def command_cancel(ns: argparse.Namespace) -> int:
                 if role_state.get("status") in {"queued", "running"}:
                     role_state["status"] = "cancelled"
 
-        record_run_event(run_dir, "run_cancelled", cancel)
+        record_run_event(run_dir, "run_cancelled", cancel, report_details(run_dir))
         print("cancelled")
         return 130
     try:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -265,6 +267,212 @@ class CursorCultUnitTests(unittest.TestCase):
         with self.assertRaises(M.UsageError):
             M.validate_write_authority(roles, {"builder"})
         M.validate_write_authority([M.Role("builder", "Builder", "Implement", "agent")], {"builder"})
+
+    def test_read_only_roles_are_refused_when_mode_capability_is_missing(self) -> None:
+        # `--mode` is the only thing holding an ask/plan role read-only, and it is
+        # emitted solely when the CLI advertises the flag. Detection fails to False
+        # when the --help probe times out, raises, or returns nothing, while every
+        # other capability defaults permissive — so failing open would launch a
+        # read-only role with argv identical to an authorized writer.
+        no_mode = M.CursorCapabilities(
+            supports_mode=False,
+            supports_resume=True,
+            supports_model=True,
+            supports_force=True,
+            supports_trust=True,
+            supports_approve_mcps=True,
+        )
+        reader = M.Role("reader", "Reader", "Investigate", "ask")
+        planner = M.Role("planner", "Planner", "Plan", "plan")
+        writer = M.Role("writer", "Writer", "Implement", "agent")
+
+        self.assertEqual(
+            M.build_cursor_args("cursor-agent", reader, "p", None, False, no_mode),
+            M.build_cursor_args("cursor-agent", writer, "p", None, True, no_mode),
+            "without --mode a read-only role is argv-identical to an authorized writer",
+        )
+        for roles in ([reader], [planner], [reader, writer]):
+            with self.assertRaises(M.UsageError) as caught:
+                M.validate_read_only_capability(roles, no_mode)
+            self.assertIn("--mode", str(caught.exception))
+        # An agent-only fleet has nothing to pin read-only, and a healthy probe is fine.
+        M.validate_read_only_capability([writer], no_mode)
+        M.validate_read_only_capability([reader, planner, writer], FULL_CAPS)
+
+    def test_partial_journal_line_is_retried_rather_than_lost(self) -> None:
+        # A watcher that commits an offset past a newline-less fragment reads the
+        # remainder as a second unparseable fragment and drops the event forever.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.ndjson"
+            terminal = {
+                "schema": M.EVENT_SCHEMA,
+                "sequence": 1,
+                "run_id": "r",
+                "event": "run_completed",
+                "message": "done",
+            }
+            line = json.dumps(terminal, sort_keys=True)
+            path.write_text(line[: len(line) // 2], encoding="utf-8")
+            offset, terminal_seen = M.stream_new_events(path, 0, 0, "jsonl")
+            self.assertEqual(offset, 0, "a partial line must not advance the offset")
+            self.assertFalse(terminal_seen)
+
+            path.write_text(line + "\n", encoding="utf-8")
+            streamed = io.StringIO()
+            with contextlib.redirect_stdout(streamed):
+                offset, terminal_seen = M.stream_new_events(path, offset, 0, "jsonl")
+            self.assertTrue(terminal_seen, "the completed record must still be delivered")
+            self.assertEqual(offset, len(line) + 1)
+            self.assertEqual(json.loads(streamed.getvalue())["event"], "run_completed")
+
+    def test_terminal_status_is_absorbing_for_a_late_supervisor(self) -> None:
+        # A supervisor that missed the startup grace must not flip a run a watcher
+        # already reconciled to failed back to running.
+        import asyncio
+
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        run_dir = Path(fixture.root) / "run"
+        run_dir.mkdir()
+        now = M.utc_now()
+        M.atomic_write_json(run_dir / "roles.json", [{"id": "r", "label": "R", "instruction": "Look"}])
+        (run_dir / "context.md").write_text(CAPSULE)
+        M.atomic_write_json(
+            run_dir / "config.json",
+            {
+                "project_root": str(fixture.repo),
+                "cursor_bin": str(FAKE),
+                "capabilities": M.dataclasses.asdict(FULL_CAPS),
+                "writer_ids": [],
+                "max_parallel": 0,
+                "resume": False,
+                "session_key": "test",
+                "require_login_auth": False,
+                "heartbeat_seconds": 540.0,
+            },
+        )
+        M.atomic_write_json(
+            run_dir / "state.json",
+            {
+                "run_id": run_dir.name,
+                "status": "failed",
+                "created_at": now,
+                "finished_at": now,
+                "updated_at": now,
+                "exit_code": 1,
+                "supervisor_error": "supervisor did not publish a process id",
+                "event_sequence": 2,
+                "roles": [{"id": "r", "label": "R", "status": "cancelled"}],
+            },
+        )
+        M.append_event_line(
+            run_dir / "events.ndjson",
+            {"schema": M.EVENT_SCHEMA, "sequence": 2, "run_id": run_dir.name, "event": "run_failed"},
+        )
+
+        exit_code = asyncio.run(M.supervise_run(run_dir))
+
+        state = M.load_run_state(run_dir)
+        events = [
+            json.loads(line)
+            for line in (run_dir / "events.ndjson").read_text().splitlines()
+        ]
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["supervisor_error"], "supervisor did not publish a process id")
+        self.assertEqual([e["event"] for e in events], ["run_failed"])
+
+    def test_mode_reason_is_published_in_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            M.atomic_write_json(
+                run_dir / "state.json",
+                {
+                    "run_id": run_dir.name,
+                    "status": "running",
+                    "created_at": M.utc_now(),
+                    "event_sequence": 0,
+                    "roles": [
+                        {
+                            "id": "auditor",
+                            "label": "Auditor",
+                            "mode": "ask",
+                            "mode_reason": "read-only review, no write authority",
+                            "status": "running",
+                        }
+                    ],
+                },
+            )
+            _, event = M.record_run_event(run_dir, "heartbeat", details={"heartbeat_seconds": 1})
+            self.assertEqual(
+                event["roles"][0]["mode_reason"], "read-only review, no write authority"
+            )
+
+    def test_role_event_details_survive_the_mutate_closure(self) -> None:
+        # supervise_run's progress() enriches the same dict it passed in, from inside
+        # its mutate closure. Snapshotting details before mutate ran dropped mode,
+        # role_status, duration_ms and error from every role event.
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            M.atomic_write_json(
+                run_dir / "state.json",
+                {
+                    "run_id": run_dir.name,
+                    "status": "running",
+                    "created_at": M.utc_now(),
+                    "event_sequence": 0,
+                    "roles": [
+                        {"id": "a", "label": "A", "mode": "ask", "status": "running"}
+                    ],
+                },
+            )
+            details: dict[str, object] = {"role_id": "a"}
+
+            def mutate(state: dict) -> None:
+                for role_state in state["roles"]:
+                    if role_state["id"] == "a":
+                        details["mode"] = role_state.get("mode")
+                        details["role_status"] = "succeeded"
+                        details["duration_ms"] = 1234
+                        role_state["status"] = "succeeded"
+
+            _, event = M.record_run_event(run_dir, "role_completed", mutate, details)
+            self.assertEqual(event["details"]["mode"], "ask")
+            self.assertEqual(event["details"]["role_status"], "succeeded")
+            self.assertEqual(event["details"]["duration_ms"], 1234)
+            self.assertIn("finished with status succeeded", event["message"])
+
+    def test_unusable_heartbeat_env_var_does_not_break_the_cli(self) -> None:
+        # build_parser() runs for every subcommand, so an eagerly parsed env default
+        # meant one `export CURSOR_CULT_HEARTBEAT_SECONDS=` bricked --version, --help,
+        # watch, and the shipped plugin monitor.
+        for raw in ("", "   ", "not-a-number", "-5", "0"):
+            with mock.patch.dict(os.environ, {"CURSOR_CULT_HEARTBEAT_SECONDS": raw}):
+                self.assertEqual(
+                    M.default_heartbeat_seconds(), float(M.DEFAULT_HEARTBEAT_SECONDS)
+                )
+                # build_parser() must not raise for any subcommand.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as exited:
+                        M.main(["--version"])
+                self.assertEqual(exited.exception.code, 0)
+                M.build_parser().parse_args(["watch", "some-run-id"])
+        with mock.patch.dict(os.environ, {"CURSOR_CULT_HEARTBEAT_SECONDS": "12.5"}):
+            self.assertEqual(M.default_heartbeat_seconds(), 12.5)
+
+    def test_event_journal_is_not_world_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            journal = run_dir / "events.ndjson"
+            previous = os.umask(0)
+            try:
+                M.append_event_line(journal, {"schema": M.EVENT_SCHEMA, "sequence": 1})
+            finally:
+                os.umask(previous)
+            self.assertEqual(journal.stat().st_mode & 0o077, 0, oct(journal.stat().st_mode))
 
     def test_terminal_event_is_recovered_if_state_outlives_journal_append(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -777,6 +985,90 @@ class CursorCultIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(terminal.returncode, 130)
         self.assertIn("cancelled", terminal.stdout)
+
+        journal = self.fixture.state / "cursor-cult" / "runs" / run_id / "events.ndjson"
+        events = [
+            json.loads(line) for line in journal.read_text().splitlines() if line.strip()
+        ]
+        self.assertEqual(events[-1]["event"], "run_cancelled")
+        self.assertEqual(events[-1]["status"], "cancelled")
+        self.assertEqual(
+            [event["event"] for event in events].count("run_cancelled"),
+            1,
+            "cancellation must deliver exactly one terminal event",
+        )
+
+    def test_watch_exits_when_the_terminal_event_was_already_acknowledged(self) -> None:
+        # A watcher reattaching past the terminal sequence has nothing left to deliver.
+        # It must exit rather than poll a finished run forever.
+        self.fixture.write_roles([{"id": "quick", "label": "Quick", "instruction": "Inspect"}])
+        started = self.run_cli(*self.fixture.command("start", "--json"))
+        self.assertEqual(started.returncode, 0, started.stderr)
+        launch = json.loads(started.stdout)
+        wait = self.run_cli(
+            sys.executable, str(RUNNER), "wait", launch["run_id"], "--poll", "0.02",
+            env=self.fixture.env(),
+        )
+        self.assertEqual(wait.returncode, 0, wait.stderr)
+        final = [
+            json.loads(line)
+            for line in Path(launch["events_path"]).read_text().splitlines()
+            if line.strip()
+        ][-1]["sequence"]
+
+        for cutoff in (final, final + 5):
+            watched = self.run_cli(
+                sys.executable, str(RUNNER), "watch", launch["run_id"],
+                "--after-sequence", str(cutoff), "--poll", "0.02",
+                env=self.fixture.env(),
+                timeout=15,
+            )
+            self.assertEqual(watched.returncode, 0, watched.stderr)
+            self.assertEqual(watched.stdout.strip(), "", f"nothing is newer than {cutoff}")
+
+    def test_watch_all_streams_only_the_matching_project_and_session(self) -> None:
+        self.fixture.write_roles([{"id": "quick", "label": "Quick", "instruction": "Inspect"}])
+        mine = json.loads(
+            self.run_cli(*self.fixture.command("start", "--json")).stdout
+        )
+        other_session = json.loads(
+            self.run_cli(
+                *self.fixture.command("start", "--json"),
+                "--session-key", "someone-elses-session",
+            ).stdout
+        )
+        for run in (mine, other_session):
+            self.run_cli(
+                sys.executable, str(RUNNER), "wait", run["run_id"], "--poll", "0.02",
+                env=self.fixture.env(),
+            )
+
+        # watch-all is a session-length transport that never exits on its own.
+        monitor = subprocess.Popen(
+            [
+                sys.executable, str(RUNNER), "watch-all",
+                "--cwd", str(self.fixture.repo),
+                "--session-key", "test-session",
+                "--poll", "0.02", "--format", "jsonl",
+            ],
+            env=self.fixture.env(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            time.sleep(1.5)
+        finally:
+            monitor.terminate()
+        stdout, stderr = monitor.communicate(timeout=10)
+        observed = {
+            json.loads(line)["run_id"] for line in stdout.splitlines() if line.strip()
+        }
+        self.assertTrue(observed, f"watch-all streamed nothing; stderr={stderr}")
+        self.assertIn(mine["run_id"], observed, "own-session run must be replayed")
+        self.assertNotIn(
+            other_session["run_id"], observed, "another session's run must be filtered out"
+        )
 
 
 if __name__ == "__main__":

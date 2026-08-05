@@ -32,5 +32,7 @@ jobs:
           python3 -m json.tool .agents/plugins/marketplace.json >/dev/null
           python3 -m json.tool plugins/cursor-cult/.claude-plugin/plugin.json >/dev/null
           python3 -m json.tool plugins/cursor-cult-codex/.codex-plugin/plugin.json >/dev/null
+          python3 -m json.tool monitors/monitors.json >/dev/null
+          python3 -m json.tool plugins/cursor-cult/monitors/monitors.json >/dev/null
       - name: CLI smoke
         run: ./bin/cursor-cult --version
