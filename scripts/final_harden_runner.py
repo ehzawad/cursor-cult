@@ -167,16 +167,6 @@ replace_once(runner, old_liveness, new_liveness)
 
 replace_once(
     runner,
-    '''    return offset, terminal_seen
-def copy_background_inputs(''',
-    '''    return offset, terminal_seen
-
-
-def copy_background_inputs(''',
-)
-
-replace_once(
-    runner,
     '''    watch_all_parser.add_argument("--session-key")
     watch_all_parser.add_argument("--poll", type=float, default=0.5)''',
     '''    watch_all_parser.add_argument("--session-key")
