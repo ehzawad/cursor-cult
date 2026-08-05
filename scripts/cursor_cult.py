@@ -47,6 +47,10 @@ READ_ONLY_MODES = ("ask", "plan")
 EVENT_SCHEMA = "cursor-cult.event.v1"
 DEFAULT_HEARTBEAT_SECONDS = 9 * 60
 SUPERVISOR_START_GRACE_SECONDS = 10
+# How far back a starting watch-all replays already-finished runs. Wide enough to
+# catch a run that completed just before the monitor attached, narrow enough that a
+# session-length monitor never re-announces the project's whole run archive.
+WATCH_ALL_REPLAY_GRACE_SECONDS = 120
 TERMINAL_EVENT_TYPES = {"run_completed", "run_failed", "run_cancelled"}
 INTENT_HEADINGS = (
     "# Intent Capsule",
@@ -366,6 +370,11 @@ def derive_session_key(explicit: str | None) -> str:
         return explicit
     env_candidates = (
         "CURSOR_CULT_SESSION_KEY",
+        # CLAUDE_CODE_SESSION_ID is what current Claude Code builds actually export;
+        # reading only the other two silently dropped every run to the terminal-level
+        # fallback, so two sessions in one terminal shared a key and each watch-all
+        # streamed the other's runs. Keep the others for older and remote hosts.
+        "CLAUDE_CODE_SESSION_ID",
         "CLAUDE_CODE_REMOTE_SESSION_ID",
         "CLAUDE_SESSION_ID",
         "CODEX_THREAD_ID",
@@ -1693,6 +1702,24 @@ def prepare_invocation(ns: argparse.Namespace) -> tuple[list[Role], str, Path, s
     return roles, context, root, cli, capabilities, status_output
 
 
+def default_max_parallel() -> int:
+    """Resolve the concurrency default without letting a bad env var brick the CLI.
+
+    Same failure shape as default_heartbeat_seconds(): build_parser() runs for every
+    subcommand, so an unusable value raised before argument parsing and took down
+    `--version`, `--help`, `watch`, and the packaged plugin monitor. 0 means uncapped,
+    so it is the fallback rather than a rejected value.
+    """
+    raw = os.environ.get("CURSOR_CULT_MAX_PARALLEL")
+    if raw is None or not raw.strip():
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    return value if value > 0 else 0
+
+
 def add_execution_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--roles-file", required=True)
     parser.add_argument("--context-file", required=True)
@@ -1701,7 +1728,7 @@ def add_execution_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-parallel",
         type=int,
-        default=int(os.environ.get("CURSOR_CULT_MAX_PARALLEL", "0")),
+        default=default_max_parallel(),
         help="cap on concurrent roles; 0 (default) means uncapped -- every "
         "requested role runs at once. Set positive to deliberately throttle.",
     )
@@ -2044,12 +2071,38 @@ def command_watch(ns: argparse.Namespace) -> int:
         time.sleep(ns.poll)
 
 
+def journal_size(run_dir: Path) -> int:
+    try:
+        return (run_dir / "events.ndjson").stat().st_size
+    except OSError:
+        return 0
+
+
+def is_recent_or_live(run_dir: Path, since: dt.datetime) -> bool:
+    """Should this run's history be replayed to a watcher starting at `since`?
+
+    Live runs always qualify. A terminal run qualifies only if it finished within
+    WATCH_ALL_REPLAY_GRACE_SECONDS of the watcher starting, which keeps the
+    just-missed-a-fast-run case covered without replaying the whole archive.
+    """
+    state = load_run_state(run_dir)
+    if state.get("status") not in TERMINAL_RUN_STATUSES:
+        return True
+    finished = parse_utc_timestamp(state.get("finished_at")) or parse_utc_timestamp(
+        state.get("updated_at")
+    )
+    if finished is None:
+        return False
+    return (since - finished).total_seconds() <= WATCH_ALL_REPLAY_GRACE_SECONDS
+
+
 def command_watch_all(ns: argparse.Namespace) -> int:
     if ns.poll <= 0:
         raise UsageError("--poll must be positive")
     target_root = str(project_root(Path(ns.cwd)))
     target_session = None if ns.all_sessions else derive_session_key(ns.session_key)
     offsets: dict[Path, int] = {}
+    started_at = dt.datetime.now(dt.timezone.utc)
 
     while True:
         root = runs_root()
@@ -2074,11 +2127,24 @@ def command_watch_all(ns: argparse.Namespace) -> int:
                 except (UsageError, OSError, ValueError):
                     continue
 
-                # Replay matching runs from sequence 1. A monitor can start a few
-                # milliseconds after a very fast run completes; filtering by the
-                # monitor's own start time would lose that terminal notification.
-                # Consumers deduplicate with the stable (run_id, sequence) pair.
-                offsets.setdefault(run_dir, 0)
+                if run_dir not in offsets:
+                    # First sighting decides how much history this run replays.
+                    #
+                    # A monitor can start milliseconds after a very fast run finishes,
+                    # so a run that is still live, or that went terminal just before we
+                    # started, replays in full from sequence 1 — losing that terminal
+                    # notification is the failure this watcher exists to prevent.
+                    #
+                    # Anything that finished before that window is history. Replaying it
+                    # meant every skill invocation re-announced the project's entire run
+                    # archive into the live session (thousands of notifications, all of
+                    # them stale), and nothing ever prunes runs_root(). Start such runs
+                    # at EOF instead. Consumers still deduplicate on (run_id, sequence).
+                    offsets[run_dir] = (
+                        0
+                        if is_recent_or_live(run_dir, started_at)
+                        else journal_size(run_dir)
+                    )
 
                 new_offset, _ = stream_new_events(
                     run_dir / "events.ndjson",
@@ -2087,6 +2153,10 @@ def command_watch_all(ns: argparse.Namespace) -> int:
                     ns.format,
                 )
                 offsets[run_dir] = new_offset
+        # Drop runs whose directories are gone so a session-length monitor's bookkeeping
+        # cannot grow without bound.
+        for gone in [path for path in offsets if not path.exists()]:
+            offsets.pop(gone, None)
         time.sleep(ns.poll)
 
 

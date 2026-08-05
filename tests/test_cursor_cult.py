@@ -462,6 +462,61 @@ class CursorCultUnitTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CURSOR_CULT_HEARTBEAT_SECONDS": "12.5"}):
             self.assertEqual(M.default_heartbeat_seconds(), 12.5)
 
+    def test_unusable_max_parallel_env_var_does_not_break_the_cli(self) -> None:
+        # Same failure shape as the heartbeat variable: parsed while building the
+        # parser, which runs for every subcommand.
+        for raw in ("", "   ", "abc", "-4"):
+            with mock.patch.dict(os.environ, {"CURSOR_CULT_MAX_PARALLEL": raw}):
+                self.assertEqual(M.default_max_parallel(), 0)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as exited:
+                        M.main(["--version"])
+                self.assertEqual(exited.exception.code, 0)
+                M.build_parser().parse_args(["watch-all"])
+        with mock.patch.dict(os.environ, {"CURSOR_CULT_MAX_PARALLEL": "6"}):
+            self.assertEqual(M.default_max_parallel(), 6)
+
+    def test_watch_all_replays_recent_runs_but_not_the_whole_archive(self) -> None:
+        # A monitor starts on every skill invocation. Replaying all history meant it
+        # re-announced the project's entire run archive into the live session.
+        def run_dir_with(name: str, finished_delta: float | None) -> Path:
+            path = Path(tmp) / name
+            path.mkdir()
+            state: dict[str, object] = {"run_id": name, "status": "running"}
+            if finished_delta is not None:
+                finished = M.dt.datetime.now(M.dt.timezone.utc) - M.dt.timedelta(
+                    seconds=finished_delta
+                )
+                state = {
+                    "run_id": name,
+                    "status": "succeeded",
+                    "finished_at": finished.isoformat().replace("+00:00", "Z"),
+                }
+            M.atomic_write_json(path / "state.json", state)
+            M.append_event_line(
+                path / "events.ndjson",
+                {"schema": M.EVENT_SCHEMA, "sequence": 1, "run_id": name, "event": "run_queued"},
+            )
+            return path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            now = M.dt.datetime.now(M.dt.timezone.utc)
+            live = run_dir_with("live", None)
+            just_finished = run_dir_with("just-finished", 5)
+            ancient = run_dir_with("ancient", M.WATCH_ALL_REPLAY_GRACE_SECONDS + 600)
+
+            self.assertTrue(M.is_recent_or_live(live, now), "a live run must replay")
+            self.assertTrue(
+                M.is_recent_or_live(just_finished, now),
+                "a run that finished just before the watcher started must replay",
+            )
+            self.assertFalse(
+                M.is_recent_or_live(ancient, now), "archived runs must not be replayed"
+            )
+            # Skipping means starting at EOF, so nothing is re-emitted.
+            self.assertEqual(M.journal_size(ancient), (ancient / "events.ndjson").stat().st_size)
+            self.assertEqual(M.journal_size(Path(tmp) / "missing"), 0)
+
     def test_event_journal_is_not_world_readable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run"
@@ -667,8 +722,10 @@ class CursorCultIntegrationTests(unittest.TestCase):
         self.assertIn("handoff role=first-lens", result.stdout)
         self.assertIn("handoff role=local-change force=1", result.stdout)
         trace = self.fixture.trace.read_text()
-        # Commands are auto-approved for every role; read-only is enforced by --mode,
-        # and only the authorized writer runs in Cursor's default (agent) mode.
+        # Commands are auto-approved for every role. Read-only rests on --mode being
+        # present, and only the authorized writer runs in Cursor's default (agent)
+        # mode. Whether --mode outranks --force is undocumented by Cursor, so this
+        # asserts the argv contract, not an enforced read-only guarantee.
         self.assertIn("first-lens|force=1|trust=1|mode=ask", trace)
         self.assertIn("local-change|force=1|trust=1|mode=|", trace)
         self.assertIn("WARNING: foreground run includes Cursor agent mode", result.stderr)
