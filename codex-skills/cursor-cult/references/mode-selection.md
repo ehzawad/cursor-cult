@@ -12,3 +12,5 @@ Claude Code or Codex, not the Python runner, chooses roles from the user's curre
 Foreground/background is a separate lifecycle choice. The same role set can run synchronously with `run` or durably and asynchronously with `start` plus a host-owned watcher.
 
 Each role should include a concise `mode_reason` so `check`, detached state, and watchdog events make the host's decision auditable.
+
+This precedence is host discipline; the runner enforces only a narrower mechanical subset. It rejects an `agent` role without `--writer`, rejects a `--writer` role not in `agent` mode, rejects more than one writer per invocation, and refuses to launch any `ask`/`plan` role when the Cursor CLI did not advertise `--mode` — because omitting `--mode` *is* how agent mode is selected, so an undetected flag would silently run a read-only role with write authority. Everything above that line, including the authority gate itself, is the host's judgment and is not machine-checked. Whether Cursor honors an explicit read-only `--mode` when `--force` is also passed is an undocumented CLI behavior the runner depends on but cannot verify.
