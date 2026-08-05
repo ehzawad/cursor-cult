@@ -1303,21 +1303,31 @@ def reconcile_run_liveness(run_dir: Path) -> dict[str, Any]:
                 )
 
     if reason is not None:
+        # An operator asked for this run to stop, so a supervisor that died without
+        # appending its own terminal event was cancelled, not failed. `cancel` records
+        # that intent before signalling precisely so the outcome does not depend on
+        # whether the supervisor survived long enough to report it.
+        cancelled = bool(state.get("cancel_requested"))
+        outcome = "cancelled" if cancelled else "failed"
+
         def fail(current: dict[str, Any]) -> None:
             if current.get("status") not in {"queued", "running"}:
                 return
             current.update(
                 {
-                    "status": "failed",
+                    "status": outcome,
                     "finished_at": current.get("finished_at") or utc_now(),
-                    "exit_code": 1,
-                    "supervisor_error": current.get("supervisor_error") or reason,
+                    "exit_code": exit_code_for_status(outcome),
                     "pid": None,
                 }
             )
+            if not cancelled:
+                current["supervisor_error"] = (
+                    current.get("supervisor_error") or reason
+                )
             # Sweep role states the way the cancellation paths do, so the terminal
             # event's summary cannot report roles as still queued/running on a run
-            # that has already failed.
+            # that has already stopped.
             for role_state in current.get("roles", []):
                 if isinstance(role_state, dict) and role_state.get("status") in {
                     "queued",
@@ -1327,7 +1337,7 @@ def reconcile_run_liveness(run_dir: Path) -> dict[str, Any]:
 
         state, _ = record_run_event(
             run_dir,
-            "run_failed",
+            terminal_event_for_status(outcome),
             fail,
             {"reason": reason, **report_details(run_dir)},
         )
@@ -1519,6 +1529,16 @@ async def supervise_run(run_dir: Path) -> int:
         )
         return exit_code_for_status(status)
 
+    # Install the cancellation handlers BEFORE publishing "running". `cancel` sends
+    # SIGTERM as soon as it observes that status, so announcing it first left a window
+    # where the default disposition killed the supervisor outright — no run_cancelled
+    # was ever appended, and the next reconcile misreported the run as failed.
+    loop = asyncio.get_running_loop()
+    current_task = asyncio.current_task()
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, current_task.cancel if current_task else lambda: None)
+
     record_run_event(run_dir, "run_started", mark_running)
 
     def progress(role_id: str, result: RoleResult | None) -> None:
@@ -1554,12 +1574,6 @@ async def supervise_run(run_dir: Path) -> int:
                 break
 
         record_run_event(run_dir, event_type, mutate, details)
-
-    loop = asyncio.get_running_loop()
-    current_task = asyncio.current_task()
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, current_task.cancel if current_task else lambda: None)
 
     heartbeat_task = asyncio.create_task(
         emit_heartbeats(run_dir, heartbeat_seconds),
@@ -2125,6 +2139,10 @@ def command_cancel(ns: argparse.Namespace) -> int:
         record_run_event(run_dir, "run_cancelled", cancel, report_details(run_dir))
         print("cancelled")
         return 130
+    # Record the intent before signalling. If the supervisor dies without appending its
+    # own run_cancelled, reconcile_run_liveness reads this and resolves the run to
+    # cancelled/130 rather than misreporting an explicit cancellation as a failure.
+    update_run_state(run_dir, lambda current: current.update({"cancel_requested": utc_now()}))
     try:
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:

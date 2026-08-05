@@ -474,6 +474,42 @@ class CursorCultUnitTests(unittest.TestCase):
                 os.umask(previous)
             self.assertEqual(journal.stat().st_mode & 0o077, 0, oct(journal.stat().st_mode))
 
+    def test_requested_cancellation_survives_a_supervisor_that_never_reported(self) -> None:
+        # cancel signals and returns; if the supervisor dies before appending its own
+        # run_cancelled, reconciliation must still resolve the run to cancelled/130
+        # rather than reporting an explicitly requested stop as a failure.
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            M.atomic_write_json(
+                run_dir / "state.json",
+                {
+                    "run_id": run_dir.name,
+                    "status": "running",
+                    "created_at": M.utc_now(),
+                    "started_at": M.utc_now(),
+                    "event_sequence": 1,
+                    "pid": 2**22,  # a pid that is not alive
+                    "cancel_requested": M.utc_now(),
+                    "roles": [{"id": "a", "label": "A", "status": "running"}],
+                },
+            )
+            state = M.reconcile_run_liveness(run_dir)
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.ndjson").read_text().splitlines()
+            ]
+            self.assertEqual(state["status"], "cancelled")
+            self.assertEqual(state["exit_code"], 130)
+            self.assertNotIn("supervisor_error", state)
+            self.assertEqual(state["roles"][0]["status"], "cancelled")
+            self.assertEqual([e["event"] for e in events], ["run_cancelled"])
+
+            # Idempotent: reconciling again must not append a second terminal event.
+            M.ensure_terminal_event(run_dir, M.reconcile_run_liveness(run_dir))
+            again = (run_dir / "events.ndjson").read_text().splitlines()
+            self.assertEqual(len(again), 1)
+
     def test_terminal_event_is_recovered_if_state_outlives_journal_append(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run"
