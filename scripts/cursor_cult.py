@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 DONE_SENTINEL = "CURSOR_CULT_DONE"
 # readline() raises LimitOverrunError past its 64KiB default; a large final
 # "result" event exceeds that and used to crash the fleet.
@@ -45,6 +45,7 @@ AGENT_MODE_EXPLANATION = (
 )
 EVENT_SCHEMA = "cursor-cult.event.v1"
 DEFAULT_HEARTBEAT_SECONDS = 9 * 60
+SUPERVISOR_START_GRACE_SECONDS = 10
 TERMINAL_EVENT_TYPES = {"run_completed", "run_failed", "run_cancelled"}
 INTENT_HEADINGS = (
     "# Intent Capsule",
@@ -364,6 +365,7 @@ def derive_session_key(explicit: str | None) -> str:
         return explicit
     env_candidates = (
         "CURSOR_CULT_SESSION_KEY",
+        "CLAUDE_CODE_REMOTE_SESSION_ID",
         "CLAUDE_SESSION_ID",
         "CODEX_THREAD_ID",
         "TERM_SESSION_ID",
@@ -1132,6 +1134,22 @@ def append_event_line(path: Path, event: dict[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
+def last_persisted_run_event(run_dir: Path) -> dict[str, Any] | None:
+    events_path = run_dir / "events.ndjson"
+    try:
+        lines = events_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("run_id") in {run_dir.name, None}:
+            return value
+    return None
+
+
 def record_run_event(
     run_dir: Path,
     event_type: str,
@@ -1157,11 +1175,13 @@ def record_run_event(
                 and state.get("status") in TERMINAL_RUN_STATUSES
             ):
                 return state, {}
-            if (
-                event_type in TERMINAL_EVENT_TYPES
-                and state.get("last_event_type") in TERMINAL_EVENT_TYPES
-            ):
-                return state, {}
+            if event_type in TERMINAL_EVENT_TYPES:
+                last_persisted = last_persisted_run_event(run_dir)
+                if (
+                    last_persisted is not None
+                    and last_persisted.get("event") in TERMINAL_EVENT_TYPES
+                ):
+                    return state, {}
             now = utc_now()
             sequence = int(state.get("event_sequence", 0)) + 1
             state["event_sequence"] = sequence
@@ -1213,11 +1233,28 @@ def reconcile_run_liveness(run_dir: Path) -> dict[str, Any]:
     state = load_run_state(run_dir)
     status = str(state.get("status", "unknown"))
     pid = state.get("pid")
-    if (
-        status in {"queued", "running"}
-        and isinstance(pid, int)
-        and not process_is_alive(pid)
-    ):
+    reason: str | None = None
+
+    if status == "running":
+        if not isinstance(pid, int) or not process_is_alive(pid):
+            reason = "supervisor process is no longer alive"
+    elif status == "queued":
+        if isinstance(pid, int):
+            if not process_is_alive(pid):
+                reason = "queued supervisor process is no longer alive"
+        else:
+            created = parse_utc_timestamp(state.get("created_at"))
+            age = (
+                (dt.datetime.now(dt.timezone.utc) - created).total_seconds()
+                if created is not None
+                else SUPERVISOR_START_GRACE_SECONDS
+            )
+            if age >= SUPERVISOR_START_GRACE_SECONDS:
+                reason = (
+                    "supervisor did not publish a process id before the startup grace period"
+                )
+
+    if reason is not None:
         def fail(current: dict[str, Any]) -> None:
             if current.get("status") not in {"queued", "running"}:
                 return
@@ -1226,8 +1263,7 @@ def reconcile_run_liveness(run_dir: Path) -> dict[str, Any]:
                     "status": "failed",
                     "finished_at": current.get("finished_at") or utc_now(),
                     "exit_code": 1,
-                    "supervisor_error": current.get("supervisor_error")
-                    or "supervisor process is no longer alive",
+                    "supervisor_error": current.get("supervisor_error") or reason,
                     "pid": None,
                 }
             )
@@ -1236,7 +1272,7 @@ def reconcile_run_liveness(run_dir: Path) -> dict[str, Any]:
             run_dir,
             "run_failed",
             fail,
-            {"reason": "supervisor process is no longer alive"},
+            {"reason": reason},
         )
     return state
 
@@ -1245,7 +1281,11 @@ def ensure_terminal_event(run_dir: Path, state: dict[str, Any]) -> dict[str, Any
     status = str(state.get("status", "unknown"))
     if status not in TERMINAL_RUN_STATUSES:
         return state
-    if state.get("last_event_type") in TERMINAL_EVENT_TYPES:
+    last_persisted = last_persisted_run_event(run_dir)
+    if (
+        last_persisted is not None
+        and last_persisted.get("event") in TERMINAL_EVENT_TYPES
+    ):
         return state
     state, _ = record_run_event(
         run_dir,
@@ -1582,6 +1622,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watch_all_parser.add_argument("--cwd", default=".")
     watch_all_parser.add_argument("--session-key")
+    watch_all_parser.add_argument(
+        "--all-sessions",
+        action="store_true",
+        help="watch every matching project run instead of the derived host session",
+    )
     watch_all_parser.add_argument("--poll", type=float, default=0.5)
     watch_all_parser.add_argument("--format", choices=("jsonl", "text"), default="jsonl")
 
@@ -1844,7 +1889,7 @@ def command_watch_all(ns: argparse.Namespace) -> int:
     if ns.poll <= 0:
         raise UsageError("--poll must be positive")
     target_root = str(project_root(Path(ns.cwd)))
-    target_session = ns.session_key
+    target_session = None if ns.all_sessions else derive_session_key(ns.session_key)
     offsets: dict[Path, int] = {}
 
     while True:
@@ -1884,7 +1929,7 @@ def command_watch_all(ns: argparse.Namespace) -> int:
 
 def command_collect(ns: argparse.Namespace) -> int:
     run_dir = run_dir_for(ns.run_id)
-    state = load_run_state(run_dir)
+    state = ensure_terminal_event(run_dir, reconcile_run_liveness(run_dir))
     status = str(state.get("status", "unknown"))
     report_path = run_dir / ("report.json" if ns.json else "report.md")
     if report_path.exists():
@@ -1920,7 +1965,7 @@ def command_tail(ns: argparse.Namespace) -> int:
                     print()
         if not ns.follow:
             return 0
-        state = load_run_state(run_dir)
+        state = ensure_terminal_event(run_dir, reconcile_run_liveness(run_dir))
         if state.get("status") in TERMINAL_RUN_STATUSES:
             return 0
         time.sleep(ns.poll)
@@ -1928,7 +1973,7 @@ def command_tail(ns: argparse.Namespace) -> int:
 
 def command_cancel(ns: argparse.Namespace) -> int:
     run_dir = run_dir_for(ns.run_id)
-    state = load_run_state(run_dir)
+    state = ensure_terminal_event(run_dir, reconcile_run_liveness(run_dir))
     status = state.get("status")
     if status in TERMINAL_RUN_STATUSES:
         print(status)

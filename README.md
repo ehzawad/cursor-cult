@@ -255,7 +255,7 @@ python3 scripts/cursor_cult.py watch <run-id>
 python3 scripts/cursor_cult.py watch <run-id> --after-sequence 12
 ```
 
-`watch` replays and follows one journal, flushes every event immediately, and exits after the terminal event. Claude Code plugin installs include a session monitor that starts on the first skill invocation and delivers every watchdog line to the live Claude harness. Codex hosts attach the returned `watch_command` to a Codex-managed background terminal so output deltas and process completion return to the main harness. Manual recovery remains available through `status`, `tail`, `wait`, `collect`, and `cancel`.
+`watch` replays and follows one journal, flushes every event immediately, and exits after the terminal event. Claude Code plugin installs include a session monitor that starts on the first skill invocation and delivers every watchdog line to the live Claude harness when Claude Code is v2.1.105 or later, the session is interactive, and the experimental Monitor facility is available. Codex hosts attach the returned `watch_command` to a Codex-managed background terminal so output deltas and process completion return to the main harness. Manual recovery remains available through `status`, `tail`, `wait`, `collect`, and `cancel`.
 
 ## Explicit detached execution
 
@@ -269,10 +269,9 @@ LAUNCH="$(python3 scripts/cursor_cult.py start \
   --cwd . \
   --session-key "manual:example")"
 RUN_ID="$(printf '%s' "$LAUNCH" | python3 -c 'import json, sys; print(json.load(sys.stdin)["run_id"])')"
-WATCH_COMMAND="$(printf '%s' "$LAUNCH" | python3 -c 'import json, shlex, sys; print(shlex.join(json.load(sys.stdin)["watch_command"]))')"
-
-# Attach this command through the host's managed background-process primitive.
-eval "$WATCH_COMMAND"
+# Attach this watcher through the host's managed background-process primitive.
+# Running it directly is the portable foreground/recovery form.
+python3 scripts/cursor_cult.py watch "$RUN_ID" --format jsonl
 
 python3 scripts/cursor_cult.py status "$RUN_ID"
 python3 scripts/cursor_cult.py tail "$RUN_ID" --follow

@@ -85,6 +85,8 @@ A writer may change the local worktree only within the capsule. It must not comm
 
 `${CLAUDE_SKILL_DIR}` is this skill directory and contains the bundled runner. Create a private staging directory, write `roles.json` and `context.md`, and preflight:
 
+The runner derives a host-session key from the environment shared by Claude Code and its plugin monitor. Set `CURSOR_CULT_SESSION_KEY` explicitly when an operator needs a stable custom key; do not depend on undocumented Claude variables.
+
 ```zsh
 RUN="$(mktemp -d "${TMPDIR:-/tmp}/cursor-cult.XXXXXX")"
 chmod 700 "$RUN"
@@ -92,8 +94,7 @@ chmod 700 "$RUN"
 python3 "${CLAUDE_SKILL_DIR}/scripts/cursor_cult.py" check \
   --roles-file "$RUN/roles.json" \
   --context-file "$RUN/context.md" \
-  --cwd "$PROJECT_ROOT" \
-  --session-key "claude:${CLAUDE_SESSION_ID}"
+  --cwd "$PROJECT_ROOT"
 ```
 
 For a normal, bounded invocation, wait for the fleet:
@@ -103,7 +104,6 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/cursor_cult.py" run \
   --roles-file "$RUN/roles.json" \
   --context-file "$RUN/context.md" \
   --cwd "$PROJECT_ROOT" \
-  --session-key "claude:${CLAUDE_SESSION_ID}" \
   > "$RUN/out.md" 2> "$RUN/err.log"
 ```
 
@@ -116,8 +116,7 @@ LAUNCH="$(python3 "${CLAUDE_SKILL_DIR}/scripts/cursor_cult.py" start \
   --json \
   --roles-file "$RUN/roles.json" \
   --context-file "$RUN/context.md" \
-  --cwd "$PROJECT_ROOT" \
-  --session-key "claude:${CLAUDE_SESSION_ID}")"
+  --cwd "$PROJECT_ROOT")"
 ```
 
 The default watchdog heartbeat is `540` seconds (nine minutes). The packaged Claude plugin monitor starts on this skill's first invocation and streams queue, role, heartbeat, failure, cancellation, and terminal-completion events into the live Claude session. When that monitor is unavailable, parse `watch_command` from `$LAUNCH` and run it with the Claude Monitor tool so each JSONL line reaches the main harness; background Bash with a retained task ID is only a fallback. A run ID means launched, never completed. On the terminal event, collect the report, inspect the workspace, and reconcile the result before answering.
