@@ -33,7 +33,59 @@ jobs:
           Path('/tmp/async-watchdog-patch.b64').write_text(workflow[start:end], encoding='utf-8')
           PY
           base64 -d /tmp/async-watchdog-patch.b64 | gzip -d > /tmp/apply_async_watchdog_patch.py
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('/tmp/apply_async_watchdog_patch.py')
+          text = path.read_text(encoding='utf-8')
+          start_marker = 'replace_once(\n    "README.md",\n    \'\'\'RUN_ID='
+          end_marker = '\n\n# Claude plugin monitor'
+          start = text.index(start_marker)
+          end = text.index(end_marker, start)
+          path.write_text(text[:start] + text[end + 2:], encoding='utf-8')
+          PY
+          python3 -m py_compile /tmp/apply_async_watchdog_patch.py
           python3 /tmp/apply_async_watchdog_patch.py
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('README.md')
+          text = path.read_text(encoding='utf-8')
+          start = text.index('```zsh\nRUN_ID=')
+          end_marker = '```\n\n`start` copies'
+          end = text.index(end_marker, start)
+          replacement = r'''```zsh
+          LAUNCH="$(python3 scripts/cursor_cult.py start \
+            --json \
+            --roles-file "$RUN/roles.json" \
+            --context-file "$RUN/context.md" \
+            --cwd . \
+            --session-key "manual:example")"
+          RUN_ID="$(printf '%s' "$LAUNCH" | python3 -c 'import json, sys; print(json.load(sys.stdin)["run_id"])')"
+          WATCH_COMMAND="$(printf '%s' "$LAUNCH" | python3 -c 'import json, shlex, sys; print(shlex.join(json.load(sys.stdin)["watch_command"]))')"
+
+          # Attach this command through the host's managed background-process primitive.
+          eval "$WATCH_COMMAND"
+
+          python3 scripts/cursor_cult.py status "$RUN_ID"
+          python3 scripts/cursor_cult.py tail "$RUN_ID" --follow
+          python3 scripts/cursor_cult.py wait "$RUN_ID"
+          python3 scripts/cursor_cult.py collect "$RUN_ID"
+          python3 scripts/cursor_cult.py cancel "$RUN_ID"
+          ```'''
+          # The YAML block adds ten spaces; remove them from the Markdown example.
+          replacement = '\n'.join(
+              line[10:] if line.startswith('          ') else line
+              for line in replacement.splitlines()
+          )
+          path.write_text(
+              text[:start]
+              + replacement
+              + '\n\n`start` copies'
+              + text[end + len(end_marker):],
+              encoding='utf-8',
+          )
+          PY
           ./scripts/sync_packages.sh
       - name: Verify patch
         shell: bash
