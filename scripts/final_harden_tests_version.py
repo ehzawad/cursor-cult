@@ -88,9 +88,7 @@ replace_once(
         for path in (
             ROOT / "pyproject.toml",
             ROOT / ".claude-plugin" / "plugin.json",
-            ROOT / ".claude-plugin" / "marketplace.json",
             ROOT / ".codex-plugin" / "plugin.json",
-            ROOT / ".agents" / "plugins" / "marketplace.json",
             ROOT / "plugins" / "cursor-cult" / ".claude-plugin" / "plugin.json",
             ROOT / "plugins" / "cursor-cult-codex" / ".codex-plugin" / "plugin.json",
         ):
@@ -105,9 +103,7 @@ for path in (
     Path("scripts/cursor_cult.py"),
     Path("pyproject.toml"),
     Path(".claude-plugin/plugin.json"),
-    Path(".claude-plugin/marketplace.json"),
     Path(".codex-plugin/plugin.json"),
-    Path(".agents/plugins/marketplace.json"),
     Path("plugins/cursor-cult/.claude-plugin/plugin.json"),
     Path("plugins/cursor-cult-codex/.codex-plugin/plugin.json"),
 ):
