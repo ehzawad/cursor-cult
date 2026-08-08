@@ -78,9 +78,11 @@ Select the mode per role from the user's current intent, authority, live evidenc
 
 Cursor accepts only `ask` and `plan` as explicit `--mode` values, so the runner selects agent mode by omitting `--mode`. `agent` is rejected unless that same role is passed as `--writer`. The runner treats role IDs as opaque host-created identities; it contains no catalog.
 
-Mode and tool access are separate decisions. Cursor's native web/search tools do not require shell. When a read-only role must run `git`, `curl`, `gh`, a package manager, tests, or another terminal command, isolate that role in its own fleet invocation and add `--readonly-shell` to both `check` and the matching `run` or `start`. Do not enable it for a mixed fleet merely because one role wants the network: the flag removes Cursor Cult's explicit `Shell(*)` deny for every `ask`/`plan` role in that invocation, and shell remains a write vector even when the role is described as read-only. If the task actually authorizes local mutation, use one `agent` writer plus `--writer` instead of weakening a reader.
+Mode and tool access are separate decisions. Cursor's native web/search tools do not require shell. When a read-only role must run `git`, `curl`, `gh`, a package manager, tests, or another terminal command, isolate that role in its own fleet invocation and add `--readonly-shell` to the matching `run` or `start`. Do not enable it for a mixed fleet merely because one role wants the network: the flag removes Cursor Cult's explicit `Shell(*)` deny for every `ask`/`plan` role in that invocation, and shell remains a write vector even when the role is described as read-only. If the task actually authorizes local mutation, use one `agent` writer plus `--writer` instead of weakening a reader.
 
 `--readonly-shell` removes only Cursor Cult's own shell deny. It does not disable Cursor's OS sandbox, change Cursor's network-access mode, bypass an enterprise allow/deny policy, or guarantee egress. Cursor Cult's detached `start` is a local process supervisor that ultimately executes the same headless `cursor-agent -p` path as foreground `run`; it is not `cursor-agent --background` and not Cursor's remote Background Agents product. An authorized agent writer already receives the runner's strongest documented local CLI path (`--force`, with agent mode selected by omitting `--mode`); `--yolo` is not a separate escape hatch, and neither flag overrides an explicit deny.
+
+Effective authority is the intersection of the operating system or outer container, Codex's sandbox and network policy, Cursor CLI permissions, and this role contract. A nested worker cannot widen the parent boundary with `--force`, `--background`, detachment, `nohup`, or `setsid`.
 
 ## 4. Preserve workspace safety
 
@@ -90,14 +92,34 @@ A writer may change the local worktree only within the Intent Capsule. It must n
 
 ## 5. Stage and run
 
-Resolve `SKILL_ROOT` as the directory containing this `SKILL.md`. Create one private staging directory and keep `roles.json` and `context.md` inside it:
+Resolve `SKILL_ROOT` as the directory containing this `SKILL.md`. The runner persists run journals, role sessions, and generated per-role Cursor configuration under `${XDG_STATE_HOME:-$HOME/.local/state}/cursor-cult`, which is normally outside the project. Resolve that path and verify the current Codex sandbox can write it before launching a fleet:
+
+```zsh
+STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/cursor-cult"
+mkdir -p "$STATE_ROOT"
+chmod 700 "$STATE_ROOT"
+```
+
+If this fails in `workspace-write`, the current child process cannot grant itself more authority. Restart the Codex host with the state root and outbound network explicitly enabled, for example:
+
+```zsh
+codex \
+  --sandbox workspace-write \
+  --add-dir "$STATE_ROOT" \
+  --ask-for-approval never \
+  -c 'sandbox_workspace_write.network_access=true'
+```
+
+`--ask-for-approval never` removes approval pauses; it does not disable the sandbox. Use Codex `--yolo` only inside an externally hardened container or VM. Network and extra writable roots are independent capabilities.
+
+Create one private staging directory and keep `roles.json` and `context.md` inside it:
 
 ```zsh
 RUN="$(mktemp -d "${TMPDIR:-/tmp}/cursor-cult.XXXXXX")"
 chmod 700 "$RUN"
 ```
 
-When an isolated read-only invocation explicitly needs terminal commands, append `--readonly-shell` to the `check` command and to the matching `run` or `start` command. Otherwise omit it. Never add it only to preflight or only to execution, because that validates and runs different permission profiles.
+When an isolated read-only invocation explicitly needs terminal commands, append `--readonly-shell` to the matching `run` or `start`. You may also append it to `check` to keep the requested argv visible, but current `check` only accepts the common option; it does not validate or report the generated shell permission. Never pass it only to `check`, and do not treat a successful preflight as proof of shell or network access.
 
 Write the synthesized files, then preflight:
 
