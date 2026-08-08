@@ -580,15 +580,18 @@ def write_role_cursor_config(
     # Stop a worker rewriting the very file that constrains it. realpath matters: the
     # resolver compares resolved paths, and on macOS $TMPDIR resolves through /private.
     deny.append(f"Write({os.path.realpath(config_dir)}/**)")
-    # And deny the whole state root, to EVERY role including an authorized writer. A
-    # writer has unrestricted Write authority over the worktree, and the state root's
-    # 0700 mode only keeps out other OS users — not a worker running as this user. That
-    # left `runs/<id>/config.json` writable by a worker, and a supervisor reads
-    # `cursor_bin`, `writer_ids`, `project_root`, roles, and context back out of it. A
-    # tampered `cursor_bin` was demonstrated to make a later supervisor launch every
-    # role through a substituted executable, which no capability re-probe can detect
-    # because the probe runs against the substituted binary. Closing the write is the
-    # only fix that actually holds; a writer has no business editing run state anyway.
+    # Deny the whole state root to every role. This closes the native write tool's path
+    # to run state, and costs nothing.
+    #
+    # It is NOT containment against an authorized writer, and must not be described as
+    # such. A writer keeps shell, and shell bypasses a `Write()` deny exactly as it does
+    # for readers — verified: a writer told to create a file under the state root did it
+    # with `echo`, exit 0, while this rule was in force. A writer already holds arbitrary
+    # execution as the invoking user and could rewrite this script, the operator's Cursor
+    # config, or PATH; run-state integrity is not a boundary that can be drawn against
+    # it. The vector that mattered — a supervisor launching workers through a substituted
+    # `cursor_bin` read out of the run directory — is closed by passing the binary on the
+    # supervisor's argv instead, which no worker can write.
     deny.append(f"Write({os.path.realpath(state_root())}/**)")
 
     # Operator entries lead, generated denies follow. Deny outranks allow in Cursor, so
@@ -2114,19 +2117,22 @@ def process_is_alive(pid: int | None) -> bool:
     return True
 
 
-async def supervise_run(run_dir: Path) -> int:
+async def supervise_run(run_dir: Path, cursor_bin: str | None = None) -> int:
     config = load_json(run_dir / "config.json")
     roles = parse_roles(run_dir / "roles.json")
     context = read_context(run_dir / "context.md")
     root = Path(config["project_root"]).resolve()
-    cli = config["cursor_bin"]
-    # Re-probe rather than trusting `config["capabilities"]`. The run directory lives
-    # under the state root, which a shell-capable worker from an earlier fleet can
-    # write, so a persisted capability record is attacker-influenceable input — and a
-    # forged `supports_disable_project_configs: true` is exactly the claim that would
-    # let a supervisor launch workers with the reader boundary removed. Re-probing also
-    # avoids trusting a record staged by an older release. One probe per supervised
-    # run, not per worker.
+    # The worker binary comes from argv, which `start` controls and no worker can write.
+    # Reading it from `config.json` was the vector: that file sits under the state root,
+    # and an authorized writer reaches the state root through *shell* — a `Write()` deny
+    # cannot stop `echo >`, which is the same reason readers get `Shell(*)` denied. A
+    # substituted `cursor_bin` made a supervisor launch every role through it, and
+    # re-probing cannot detect that because the probe runs against the substitute.
+    # Falling back to the persisted value keeps runs staged by an older release working.
+    cli = cursor_bin or config["cursor_bin"]
+    # Capabilities are re-probed rather than rehydrated for the same reason: a persisted
+    # `supports_disable_project_configs: true` would be a claim the run directory makes
+    # about itself. One probe per supervised run, not per worker.
     capabilities, _ = run_cursor_probe(cli, root)
     writer_ids = set(config.get("writer_ids", []))
     heartbeat_seconds = float(
@@ -2451,6 +2457,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     internal = subparsers.add_parser("_supervise", help=argparse.SUPPRESS)
     internal.add_argument("run_dir")
+    internal.add_argument("--cursor-bin")
     return parser
 
 
@@ -2599,7 +2606,18 @@ def command_start(ns: argparse.Namespace) -> int:
         os.fchmod(log_handle.fileno(), 0o600)
     try:
         proc = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "_supervise", str(run_dir)],
+            # The binary travels by argv, not through the run directory. `config.json`
+            # lives under the state root, which an authorized writer can rewrite via
+            # shell, and the supervisor would otherwise launch every worker through
+            # whatever path it found there.
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "_supervise",
+                str(run_dir),
+                "--cursor-bin",
+                cli,
+            ],
             stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
@@ -3045,7 +3063,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if ns.command == "cancel":
             return command_cancel(ns)
         if ns.command == "_supervise":
-            return asyncio.run(supervise_run(Path(ns.run_dir)))
+            return asyncio.run(
+                supervise_run(Path(ns.run_dir), getattr(ns, "cursor_bin", None))
+            )
         parser.error(f"unsupported command: {ns.command}")
         return 2
     except UsageError as exc:

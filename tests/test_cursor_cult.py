@@ -312,6 +312,23 @@ class CursorCultUnitTests(unittest.TestCase):
             caps, _ = M.run_cursor_probe(str(FAKE), project)
             self.assertTrue(caps.supports_disable_project_configs)
 
+    def test_supervisor_takes_its_binary_from_argv_not_run_state(self) -> None:
+        """A tampered `config.json` must not choose the worker executable.
+
+        `config.json` lives under the state root, and an authorized writer reaches it
+        through shell — a `Write()` deny cannot stop `echo >`. Verified against the real
+        CLI: a writer created a file under the state root with exit 0 while the deny was
+        in force. So the binary travels on the supervisor's argv, which no worker writes,
+        and the persisted value is only a fallback for runs staged by an older release.
+        """
+        spec = M.build_parser().parse_args(
+            ["_supervise", "/some/run/dir", "--cursor-bin", "/trusted/cursor-agent"]
+        )
+        self.assertEqual(spec.cursor_bin, "/trusted/cursor-agent")
+        source = Path(M.__file__).read_text(encoding="utf-8")
+        self.assertIn('cli = cursor_bin or config["cursor_bin"]', source)
+        self.assertIn('"--cursor-bin",\n                cli,', source)
+
     def test_state_root_is_denied_to_every_role_including_writers(self) -> None:
         """Run state must not be writable by any worker.
 
