@@ -110,10 +110,11 @@ Role failures are isolated. A fleet with both successes and failures returns `pa
 
 ## Security boundaries
 
-- The capsule is trusted host intent; repository and worker content are untrusted evidence.
-- Read-only is enforced through Cursor mode and an explicit prompt contract, but it is not an OS sandbox.
-- Workers have no terminal, so `--trust`, `--approve-mcps`, and `--force` are passed for every role; an unanswered interactive gate otherwise kills the role before it produces a result. `--force` is not merely a prompt suppressor, though: Cursor's headless documentation states that "without `--force`, changes are only proposed, not applied", so in `-p` mode it is the flag that makes edits real. Read-only roles are held read-only by `--mode` alone, and whether an explicit `ask`/`plan` mode outranks `--force` is undocumented — an external dependency on the installed CLI, not a guarantee this runner enforces. Because omitting `--mode` *is* how agent mode is selected, a read-only role is refused outright when the CLI does not advertise the flag.
-- Write authority comes from Cursor's default agent mode. Agent mode and `--writer` must name the same role: an agent-mode role without `--writer` is rejected, and a `--writer` role not in agent mode is rejected rather than running silently read-only.
-- Writer prompts prohibit remote/external side effects absent explicit user authorization.
-- Staging is private and symlink-resistant.
-- Run and session state contain no Cursor API keys.
+- The capsule is trusted host intent; repository, project configuration, and worker content are untrusted evidence.
+- Per-role Cursor configuration preserves operator permission entries and appends role-specific denies. Malformed operator permissions fail closed.
+- Workers pass `--disable-project-configs` so repository `.cursor/cli.json` cannot replace generated permission arrays or weaken operator policy. A CLI without that capability is refused.
+- Read-only `ask` and `plan` roles deny both `Write(**)` and `Shell(*)`; deny rules outrank `--force`. `--readonly-shell` is an explicit unsafe elevation accepted only for one isolated reader and is not a read-only shell.
+- Write authority comes from Cursor's default agent mode. Agent mode and `--writer` must name the same exact role, and one shared worktree permits one writer.
+- Writer prompts prohibit remote or external side effects absent explicit user authorization. Operator-specific deny rules remain active for writers.
+- Staging is private and symlink-resistant. Run and session state contain no Cursor API keys.
+- Detached liveness uses an inherited kernel `flock`; reconciliation reaps identity-checked orphan workers before publishing a terminal event.

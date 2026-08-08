@@ -11,7 +11,9 @@ if [[ ${1:-} == "status" ]]; then
   exit 0
 fi
 if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
-  echo "cursor-agent -p --output-format stream-json --mode --model --resume --force --trust --approve-mcps"
+  help="cursor-agent -p --output-format stream-json --mode --model --resume --force --trust --approve-mcps"
+  [[ ${FAKE_CURSOR_NO_DISABLE_PROJECT_CONFIGS:-0} == 1 ]] || help="$help --disable-project-configs"
+  echo "$help"
   exit 0
 fi
 if [[ ${1:-} == "--version" ]]; then
@@ -33,6 +35,7 @@ force=0
 trust=0
 mode=""
 resume=""
+disable_project_configs=0
 args=("$@")
 for ((i=0; i<${#args[@]}; i++)); do
   case ${args[$i]} in
@@ -41,11 +44,41 @@ for ((i=0; i<${#args[@]}; i++)); do
     --mode) ((i+=1)); mode=${args[$i]:-} ;;
     --resume) ((i+=1)); resume=${args[$i]:-} ;;
     --resume=*) resume=${args[$i]#--resume=} ;;
+    --disable-project-configs) disable_project_configs=1 ;;
   esac
 done
 
 if [[ -n ${FAKE_CURSOR_TRACE:-} ]]; then
-  printf '%s|force=%s|trust=%s|mode=%s|resume=%s\n' "$role" "$force" "$trust" "$mode" "$resume" >> "$FAKE_CURSOR_TRACE"
+  printf '%s|force=%s|trust=%s|mode=%s|resume=%s|project-configs-disabled=%s\n' "$role" "$force" "$trust" "$mode" "$resume" "$disable_project_configs" >> "$FAKE_CURSOR_TRACE"
+fi
+
+if [[ ${FAKE_CURSOR_REQUIRE_PROJECT_CONFIGS_DISABLED:-0} == 1 && $disable_project_configs != 1 ]]; then
+  echo "project configs were not disabled" >&2
+  exit 96
+fi
+
+if [[ -n ${FAKE_CURSOR_ASSERT_EFFECTIVE_DENIES:-} || -n ${FAKE_CURSOR_ASSERT_EFFECTIVE_NOT_DENIES:-} ]]; then
+  python3 - "$CURSOR_CONFIG_DIR/cli-config.json" "$PWD/.cursor/cli.json"     "$disable_project_configs" "${FAKE_CURSOR_ASSERT_EFFECTIVE_DENIES:-}"     "${FAKE_CURSOR_ASSERT_EFFECTIVE_NOT_DENIES:-}" <<'PY_FAKE_POLICY'
+import json
+import sys
+from pathlib import Path
+
+global_path, project_path, disabled, required, forbidden = sys.argv[1:]
+config = json.loads(Path(global_path).read_text())
+permissions = dict(config.get("permissions") or {})
+project = Path(project_path)
+if disabled != "1" and project.exists():
+    value = json.loads(project.read_text())
+    if isinstance(value, dict) and isinstance(value.get("permissions"), dict):
+        permissions.update(value["permissions"])
+deny = permissions.get("deny") or []
+required_tokens = [item for item in required.split("||") if item]
+forbidden_tokens = [item for item in forbidden.split("||") if item]
+missing = [item for item in required_tokens if item not in deny]
+present = [item for item in forbidden_tokens if item in deny]
+if missing or present:
+    raise SystemExit(f"effective deny mismatch missing={missing} forbidden-present={present} deny={deny}")
+PY_FAKE_POLICY
 fi
 
 if contains_role "${FAKE_CURSOR_SLEEP_ROLES:-}" "$role"; then

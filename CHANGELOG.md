@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Preserve valid operator `permissions.allow` and `permissions.deny` entries in every generated role config instead of replacing them; malformed permission structures now fail closed.
+- Pass and require Cursor's `--disable-project-configs` so an untrusted repository `.cursor/cli.json` cannot replace generated permission arrays, remove reader containment, or erase operator denies.
+- Restrict `--readonly-shell` to one isolated `ask`/`plan` role with no writer. It remains a mutation-capable escape hatch, but narrower operator shell denies survive it.
+- Add adversarial fake-CLI coverage for hostile project permissions, permission preservation, malformed policy, missing isolation capability, and mixed-fleet shell elevation.
+- Correct stale security, liveness, watcher-singleton, and session-key documentation.
+
 ## 0.6.0 — 2026-08-05
 
 - **Read-only is now enforced by Cursor, not assumed.** Every non-writer role runs against its own Cursor CLI configuration carrying `permissions.deny` of `Write(**)` and `Shell(*)`, supplied through `CURSOR_CONFIG_DIR`. Cursor documents that deny rules outrank allow rules, and this was verified against the installed CLI: in agent mode, *with* `--force`, a denied write and a denied shell command were both refused and the target file was left byte-identical. Until now the read-only guarantee rested entirely on the undocumented hope that `--mode ask` outranks `--force`; it no longer depends on that question at all. Shell is denied because it is itself a write vector — redirection, `sed -i`, and `rm` all bypass a `Write()` deny — while Cursor's own file-reading tools are unaffected, so read-only roles keep working. Pass `--readonly-shell` to restore shell for investigative roles that need it.
