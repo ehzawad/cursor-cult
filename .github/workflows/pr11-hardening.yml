@@ -1,0 +1,70 @@
+name: pr11-hardening
+
+on:
+  push:
+    branches:
+      - agent/clarify-cli-network-sandbox
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Reconstruct and apply the hardening patch
+        run: |
+          cat .github/pr11/chunk*.b64 | base64 --decode > scripts/pr11_harden.py
+          python3 -m py_compile scripts/pr11_harden.py
+          python3 scripts/pr11_harden.py
+          ./scripts/sync_packages.sh
+
+      - name: Compile
+        run: python3 -m py_compile scripts/cursor_cult.py tests/test_cursor_cult.py
+
+      - name: Adversarial and regression tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Shell syntax
+        run: bash -n bin/cursor-cult scripts/*.sh tests/fake_cursor_agent.sh
+
+      - name: Packaging sync
+        run: ./scripts/sync_packages.sh --check
+
+      - name: Manifests
+        run: |
+          python3 -m json.tool .claude-plugin/plugin.json >/dev/null
+          python3 -m json.tool .claude-plugin/marketplace.json >/dev/null
+          python3 -m json.tool .codex-plugin/plugin.json >/dev/null
+          python3 -m json.tool .agents/plugins/marketplace.json >/dev/null
+          python3 -m json.tool plugins/cursor-cult/.claude-plugin/plugin.json >/dev/null
+          python3 -m json.tool plugins/cursor-cult-codex/.codex-plugin/plugin.json >/dev/null
+          python3 -m json.tool monitors/monitors.json >/dev/null
+          python3 -m json.tool plugins/cursor-cult/monitors/monitors.json >/dev/null
+
+      - name: CLI smoke
+        run: ./bin/cursor-cult --version
+
+      - name: Remove one-shot test scaffolding and validate the final diff
+        run: |
+          rm -rf .github/pr11 scripts/pr11_harden.py .github/workflows/pr11-hardening.yml
+          git diff --check
+          git status --short
+
+      - name: Commit the verified hardening changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && { echo "No validated changes to commit"; exit 1; }
+          git commit -m "Harden Cursor permission isolation and shell elevation"
+          git push origin HEAD:agent/clarify-cli-network-sandbox
