@@ -202,7 +202,7 @@ Read-only workers receive an explicit no-mutation contract. A single role can be
 cursor-cult run ... --writer exact-role-id
 ```
 
-Workers are non-interactive, so `--trust`, `--approve-mcps`, and `--force` are passed to every role — an unanswered prompt would otherwise kill the worker before it produced anything. Write authority is *declared* through Cursor's agent mode, and the two directions are bound together and checked before launch: a role declaring `"mode": "agent"` without `--writer` is rejected, and a `--writer` role that is not in agent mode is rejected rather than running silently read-only.
+Workers are non-interactive, so `--trust` and `--force` are passed to every role — an unanswered prompt would otherwise kill the worker before it produced anything. Every role also runs with `--disable-project-configs` so a repository `.cursor/cli.json` cannot replace the generated permission arrays, and `--approve-mcps` is limited to an authorized writer so a repository `.cursor/mcp.json` cannot spawn local processes on behalf of a read-only role. Write authority is *declared* through Cursor's agent mode, and the two directions are bound together and checked before launch: a role declaring `"mode": "agent"` without `--writer` is rejected, and a `--writer` role that is not in agent mode is rejected rather than running silently read-only.
 
 Be precise about what `--force` does, because it is not just a prompt suppressor. Cursor's headless documentation states that you "combine `--print` with `--force` (or `--yolo`) to modify files in scripts" and that "without `--force`, changes are only proposed, not applied" — so in `-p` mode `--force` is the flag that makes edits real.
 

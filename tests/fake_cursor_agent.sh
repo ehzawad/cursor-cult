@@ -6,18 +6,62 @@ contains_role() {
   [[ ",$list," == *",$role,"* ]]
 }
 
-if [[ ${1:-} == "status" ]]; then
-  echo "Logged in with browser session"
+# Option handling mirrors the real cursor-agent, because two of its properties are
+# load-bearing and mismodelling either one lets a launch-blocking bug pass CI:
+#
+#   1. `--disable-project-configs` is REAL but HIDDEN. Cursor registers it with
+#      Commander's `.hideHelp()`, so it works and never appears in `--help`. A fake that
+#      prints it in `--help` makes a help-text capability probe look correct when it can
+#      never be correct against the real binary.
+#   2. `--help` and `--version` short-circuit BEFORE option validation, so
+#      `cursor-agent --any-nonsense --help` exits 0. Any probe built on them reports
+#      every imaginable flag as supported. Unknown options are otherwise rejected as
+#      `error: unknown option '<x>'` with exit 1.
+#
+# FAKE_CURSOR_LEGACY=1 models a CLI that genuinely lacks the flag — rejection, not
+# omission from help — so fail-closed behaviour is testable in both directions.
+for _arg in "$@"; do
+  case $_arg in
+    --help|-h)
+      # Deliberately omits --disable-project-configs. The real binary hides it.
+      echo "cursor-agent -p --output-format stream-json --mode --model --resume --force --trust --approve-mcps"
+      exit 0 ;;
+    --version|-v)
+      echo "cursor-agent 2026.08"
+      exit 0 ;;
+  esac
+done
+
+_skip_value=0
+for _arg in "$@"; do
+  if [[ $_skip_value == 1 ]]; then _skip_value=0; continue; fi
+  case $_arg in
+    --output-format|--mode|--model|--resume) _skip_value=1; continue ;;
+    --disable-project-configs)
+      if [[ ${FAKE_CURSOR_LEGACY:-0} == 1 ]]; then
+        echo "error: unknown option '--disable-project-configs'" >&2
+        exit 1
+      fi
+      continue ;;
+    -p|--print|--force|--trust|--approve-mcps) continue ;;
+    --*)
+      echo "error: unknown option '$_arg'" >&2
+      exit 1 ;;
+  esac
+done
+
+# `mcp list` is the capability probe target: cheap, parses options, no auth round-trip.
+if [[ " $* " == *" mcp "* && " $* " == *" list "* ]]; then
+  echo "No MCP servers configured (expected in .cursor/mcp.json or ~/.cursor/mcp.json)"
   exit 0
 fi
-if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
-  echo "cursor-agent -p --output-format stream-json --mode --model --resume --force --trust --approve-mcps"
-  exit 0
-fi
-if [[ ${1:-} == "--version" ]]; then
-  echo "cursor-agent 2026.08"
-  exit 0
-fi
+
+for _arg in "$@"; do
+  if [[ $_arg == status ]]; then
+    echo "Logged in with browser session"
+    exit 0
+  fi
+done
 
 if [[ ${FAKE_CURSOR_EXPECT_STRIPPED:-0} == 1 ]]; then
   if [[ -n ${CURSOR_API_KEY:-} || -n ${CURSOR_AGENT_API_KEY:-} ]]; then
