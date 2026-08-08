@@ -25,6 +25,20 @@ jobs:
         if: github.head_ref == 'agent/clarify-cli-network-sandbox'
         run: |
           cat .github/pr11/chunk*.b64 | base64 --decode > scripts/pr11_harden.py
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("scripts/pr11_harden.py")
+          text = path.read_text()
+          text = text.replace(
+              r"printf '%s|force=%s|trust=%s|mode=%s|resume=%s\n'",
+              r"printf '%s|force=%s|trust=%s|mode=%s|resume=%s\\n'",
+          )
+          text = text.replace(
+              r"printf '%s|force=%s|trust=%s|mode=%s|resume=%s|project-configs-disabled=%s\n'",
+              r"printf '%s|force=%s|trust=%s|mode=%s|resume=%s|project-configs-disabled=%s\\n'",
+          )
+          path.write_text(text)
+          PY
           python3 -m py_compile scripts/pr11_harden.py
           python3 scripts/pr11_harden.py
           ./scripts/sync_packages.sh
