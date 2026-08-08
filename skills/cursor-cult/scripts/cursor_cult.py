@@ -738,14 +738,11 @@ def build_cursor_args(
     # an unanswered workspace-trust, MCP-approval, or command-approval prompt exits 1
     # with no result event.
     #
-    # `--force` is NOT merely a prompt suppressor. Cursor's headless documentation is
-    # explicit that "without --force, changes are only proposed, not applied", so in
-    # `-p` mode it is the flag that makes edits real. Read-only roles are therefore
-    # held read-only by `--mode` alone, and Cursor does not document whether an
-    # explicit `ask`/`plan` mode outranks `--force`. Treat that precedence as an
-    # unverified external dependency, not a guarantee enforced here — which is why
-    # validate_read_only_capability() refuses to launch a read-only role at all when
-    # `--mode` was not positively detected.
+    # `--force` is NOT merely a prompt suppressor. Cursor documents it as allowing
+    # commands unless explicitly denied, and print mode needs it for real file edits.
+    # Read-only roles therefore use three independent guards: explicit ask/plan mode,
+    # generated Write(**)/Shell(*) denies, and disabled project CLI configuration so a
+    # repository cannot replace those arrays. Missing capabilities fail closed.
     if capabilities.supports_trust:
         args.append("--trust")
     if capabilities.supports_approve_mcps:
@@ -1169,12 +1166,10 @@ def validate_read_only_capability(
 ) -> None:
     """Refuse to launch read-only roles that cannot be pinned to an explicit mode.
 
-    `--mode` is the only mechanism that holds an `ask`/`plan` role read-only, and it
-    is emitted solely when the CLI advertises the flag. Detection fails to False when
-    the `--help` probe times out, raises, or returns nothing, while every other
-    capability defaults permissive — so failing open here would silently launch a
-    read-only role in Cursor's default agent mode carrying `--force`, identical to an
-    authorized writer. Fail closed instead: no mode flag, no read-only role.
+    Explicit ask/plan mode is one independent guard alongside generated permission
+    denies and project-config isolation. Because omitting `--mode` selects agent mode,
+    a failed or empty capability probe must never silently turn a reader into a writer.
+    Fail closed instead: no positively advertised mode flag, no read-only role.
     """
     if capabilities.supports_mode:
         return

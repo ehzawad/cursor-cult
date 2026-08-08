@@ -14,7 +14,7 @@ The host writes an immutable Intent Capsule containing the verbatim request, aut
 
 Every role receives a stable private `CURSOR_CONFIG_DIR`. Cursor Cult copies non-secret operator settings, removes `authInfo`, preserves existing `permissions.allow` and `permissions.deny`, and appends its own role-specific denies. Malformed permission structures fail closed instead of being silently discarded.
 
-Cursor's project-level `.cursor/cli.json` permission arrays can replace global arrays. Every worker therefore passes `--disable-project-configs`; a CLI that does not advertise that switch is refused before launch. Repository configuration cannot erase operator denies, the generated `Write(**)` / `Shell(*)` reader boundary, or protection of the generated config itself.
+Cursor's project-level `.cursor/cli.json` permission arrays can replace global arrays. Every worker therefore passes `--disable-project-configs`; a CLI that does not advertise that switch is refused before launch. Repository configuration cannot erase operator denies, the generated `Write(**)` / `Shell(*)` reader boundary, or protection of the generated config through Cursor's native Write tool. The tradeoff is that worker invocations ignore project `.cursor/cli.json`; settings required from that file must be promoted to trusted operator configuration or supplied explicitly. A shell-enabled role remains able to mutate anything allowed by the outer OS sandbox.
 
 ## Mutation
 
