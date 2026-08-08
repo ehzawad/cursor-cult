@@ -1,5 +1,36 @@
 # Host integration
 
+## Cursor process mode and nested capability boundary
+
+Cursor Cult intentionally uses Cursor's structured headless interface: `cursor-agent -p --output-format stream-json`. The runner pre-answers non-interactive gates with `--trust`, `--approve-mcps`, and `--force`; an authorized `agent` writer is selected by omitting `--mode`, while read-only workers are pinned to `ask` or `plan`. Do not replace this with `cursor-agent --background`. Cursor documents `-p` as the scripting/non-interactive interface with tool access, while `--background` opens the background composer picker; it does not enlarge filesystem or network authority and does not provide the NDJSON protocol the runner consumes.
+
+Effective authority is an intersection, not a union:
+
+```text
+operating system / container
+  ∩ Claude Code or Codex sandbox and network policy
+  ∩ Cursor CLI permission configuration
+  ∩ Cursor Cult role contract
+```
+
+A nested `cursor-agent` cannot escape a parent host sandbox by using `--force`, `--background`, `nohup`, `setsid`, or a detached Cursor Cult `start`. Detaching changes lifecycle ownership only. If direct `cursor-agent -p --force ...` can reach a host but the same operation fails when Claude Code or Codex launches Cursor Cult, change the parent host's sandbox/network policy rather than adding Cursor flags.
+
+Read-only `ask` and `plan` roles deny `Shell(*)` by default. Consequently, shell-based networking and tooling such as `curl`, `git`, `gh`, package managers, and custom scripts are intentionally unavailable even when the parent host has network access. Add `--readonly-shell` to the corresponding `run` or `start` invocation only when a read-only role genuinely needs shell execution. The option is fleet-wide and shell is itself a write vector, so prefer a separate, narrowly scoped fleet for those roles. An authorized `agent` writer already receives shell access and does not need `--readonly-shell`.
+
+For Claude Code, configure required destinations under `sandbox.network.allowedDomains`, or deliberately exempt the exact top-level launcher with `sandbox.excludedCommands` when domain-scoped access is insufficient. OS-level sandbox rules apply to child processes. The `dangerouslyDisableSandbox` retry is a separate, permission-gated escape hatch; do not silently broaden to it. For Codex, `workspace-write` has no outbound network unless `sandbox_workspace_write.network_access=true`; use `danger-full-access` or `--yolo` only inside an externally hardened container or VM. Approval bypass and sandbox/network access are separate controls in both hosts.
+
+When the cause is unclear, compare the same minimal probe in three places: the user's ordinary terminal, a Cursor Cult `agent` writer, and an `ask` role launched with `--readonly-shell`. Preserve exact exit codes and stderr from the per-role logs. Direct success plus nested failure identifies the parent host boundary; writer success plus read-only failure identifies Cursor Cult's `Shell(*)` deny; failure in all three points to DNS, proxy, firewall, authentication, or the remote service rather than this runner.
+
+Official references:
+
+- [Cursor CLI parameters](https://docs.cursor.com/en/cli/reference/parameters)
+- [Cursor headless CLI](https://docs.cursor.com/en/cli/headless)
+- [Claude Code sandboxing](https://code.claude.com/docs/en/sandboxing)
+- [Claude Code settings](https://code.claude.com/docs/en/settings)
+- [Codex CLI reference](https://developers.openai.com/codex/cli/reference)
+- [Codex security](https://developers.openai.com/codex/security)
+- [Codex configuration reference](https://developers.openai.com/codex/config-reference)
+
 Normal completion-oriented work may use foreground `run`. Any user-requested asynchronous, detached, or plausibly long-running fleet uses durable `start --json`; do not merely background `run`. `start` returns a run ID, event-journal path, 540-second heartbeat interval, and an exact `watch_command`.
 
 The supervisor persists `cursor-cult.event.v1` JSONL events for queueing, role transitions, nine-minute heartbeats, terminal completion, failure, and cancellation. `watch <run-id>` replays the journal, follows it, and exits after the terminal event. Reattach with `--after-sequence` without duplicating previously consumed events.
