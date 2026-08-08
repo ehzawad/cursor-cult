@@ -270,19 +270,66 @@ class CursorCultUnitTests(unittest.TestCase):
         The probe must key on whether an invocation accepts the flag. A fake whose
         `--help` omits it — exactly like the real binary — must still be detected.
         """
-        env = dict(os.environ)
-        self.assertTrue(
-            M.probe_flag_accepted(str(FAKE), env, "--disable-project-configs")
-        )
-        self.assertFalse(M.probe_flag_accepted(str(FAKE), env, "--not-a-real-flag"))
-        legacy = dict(env, FAKE_CURSOR_LEGACY="1")
-        self.assertFalse(
-            M.probe_flag_accepted(str(FAKE), legacy, "--disable-project-configs")
-        )
         help_text = subprocess.run(
             [str(FAKE), "--help"], capture_output=True, text=True, check=False
         ).stdout
         self.assertNotIn("--disable-project-configs", help_text)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            caps, status = M.run_cursor_probe(str(FAKE), Path(tmp))
+            self.assertTrue(caps.supports_disable_project_configs)
+            self.assertIn("Logged in", status)
+
+            # A CLI that genuinely rejects the flag must be detected as lacking it,
+            # not mistaken for an authentication failure.
+            with mock.patch.dict(os.environ, {"FAKE_CURSOR_LEGACY": "1"}, clear=False):
+                legacy_caps, legacy_status = M.run_cursor_probe(str(FAKE), Path(tmp))
+            self.assertFalse(legacy_caps.supports_disable_project_configs)
+            self.assertIn("Logged in", legacy_status)
+
+    def test_capability_probe_does_not_change_directory(self) -> None:
+        """A relative --cursor-bin must survive the probe.
+
+        Probing in a scratch cwd broke `--cursor-bin ./cursor-agent`: the relative path
+        does not resolve there, the OSError was swallowed, and the capability read as
+        absent — bricking every entry point on a CLI that supports the flag.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "cursor-agent").symlink_to(FAKE)
+            caps, _ = M.run_cursor_probe("./cursor-agent", project)
+            self.assertTrue(caps.supports_disable_project_configs)
+
+    def test_capability_probe_survives_a_malformed_project_config(self) -> None:
+        """A repository `.cursor/cli.json` must not brick preflight.
+
+        The flagged call runs first precisely so the repository file is never read.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / ".cursor").mkdir()
+            (project / ".cursor" / "cli.json").write_text("{not json")
+            caps, _ = M.run_cursor_probe(str(FAKE), project)
+            self.assertTrue(caps.supports_disable_project_configs)
+
+    def test_state_root_is_denied_to_every_role_including_writers(self) -> None:
+        """Run state must not be writable by any worker.
+
+        A writer has unrestricted Write authority over the worktree, and the state
+        root's 0700 mode only excludes other OS users. That left `config.json` — which
+        a supervisor reads `cursor_bin`, `writer_ids`, and `project_root` back out of —
+        writable by a worker running as this user.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                os.environ, {"XDG_STATE_HOME": str(Path(tmp) / "state")}, clear=False
+            ):
+                expected = f"Write({os.path.realpath(M.state_root())}/**)"
+                for allow_edit in (False, True):
+                    cfg = Path(tmp) / f"role-{allow_edit}"
+                    M.write_role_cursor_config(cfg, allow_edit=allow_edit, allow_shell=True)
+                    deny = json.loads((cfg / "cli-config.json").read_text())["permissions"]["deny"]
+                    self.assertIn(expected, deny, f"allow_edit={allow_edit}")
 
     def _operator_config(self, home: Path, payload: object) -> None:
         (home / ".cursor").mkdir(parents=True, exist_ok=True)
@@ -1042,27 +1089,50 @@ class RealCursorCliTests(unittest.TestCase):
 
     def test_capability_probe_matches_the_installed_binary(self) -> None:
         cli = shutil.which("cursor-agent")
-        env = M.sanitized_cursor_env()
         help_text = subprocess.run(
             [cli, "--help"], capture_output=True, text=True, check=False, timeout=60
         ).stdout
-        accepted = M.probe_flag_accepted(cli, env, "--disable-project-configs")
+        with tempfile.TemporaryDirectory() as tmp:
+            caps, _ = M.run_cursor_probe(cli, Path(tmp))
         self.assertTrue(
-            accepted,
+            caps.supports_disable_project_configs,
             "the installed Cursor CLI rejected --disable-project-configs; cursor-cult "
             "will refuse to launch until it is upgraded",
         )
-        self.assertFalse(
-            M.probe_flag_accepted(cli, env, "--cursor-cult-not-a-real-flag"),
-            "probe reported a nonexistent flag as supported — it fails open",
-        )
         if "--disable-project-configs" not in help_text:
-            # The expected state today. Asserted explicitly so that a help-text probe
-            # can never be reintroduced without this test objecting.
+            # The expected state today: the option is registered with .hideHelp(), so a
+            # help-text probe would read False here and refuse every launch. Asserted
+            # explicitly so that probe can never be reintroduced unnoticed.
             self.assertTrue(
-                accepted,
+                caps.supports_disable_project_configs,
                 "flag is hidden from --help yet accepted: never probe help text",
             )
+
+    def test_probe_does_not_start_mcp_servers(self) -> None:
+        """The probe must not touch MCP configuration.
+
+        `mcp list` looked like a cheap option-parsing subcommand, but it starts or
+        contacts configured servers: a user-level manifest pointing at a hung server
+        turned the probe into a 30-second timeout reported as "the CLI rejected the
+        flag", and orphaned the server's child process.
+        """
+        cli = shutil.which("cursor-agent")
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            marker = Path(tmp) / "MCP_WAS_STARTED"
+            server = Path(tmp) / "server.sh"
+            server.write_text(f'#!/bin/bash\ntouch "{marker}"\nsleep 30\n')
+            server.chmod(0o755)
+            (project / ".cursor").mkdir()
+            (project / ".cursor" / "mcp.json").write_text(
+                json.dumps({"mcpServers": {"probe": {"command": str(server), "args": []}}})
+            )
+            started = time.monotonic()
+            M.run_cursor_probe(cli, project)
+            elapsed = time.monotonic() - started
+        self.assertFalse(marker.exists(), "probe started a project MCP server")
+        self.assertLess(elapsed, 20, "probe took long enough to suggest MCP contact")
 
 
 class CursorCultIntegrationTests(unittest.TestCase):

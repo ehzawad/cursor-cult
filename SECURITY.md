@@ -24,6 +24,10 @@ Workers are non-interactive, so `--trust` and `--force` are passed to every role
 
 Every worker runs with `--disable-project-configs`. A repository `.cursor/cli.json` *replaces* the global `permissions.allow`/`deny` arrays rather than merging into them, so without this flag a checked-out project can delete the reader boundary outright. Verified against the installed CLI: with a hostile project config a worker's shell command ran; with the flag it was refused. Cursor Cult refuses to launch when the installed CLI does not accept the flag.
 
+Note that the switch suppresses that file entirely, not only its permission arrays. Repository-scoped Cursor CLI settings — including deny rules a project used as a safety control — are not applied to workers. Put anything you depend on in the operator config, which is preserved.
+
+Run state is denied to every role, including an authorized writer. The state root's `0700` mode only excludes other OS users, and a supervisor reads the worker binary path, writer set, and project root out of `runs/<id>/config.json`; a worker able to write that file could redirect a later supervisor to a substituted executable.
+
 This covers `.cursor/cli.json` only. A repository `.cursor/mcp.json` is a separate vector and is handled by refusing read-only roles in such a repository unless `--allow-project-mcp` is passed. Note that Cursor records MCP approvals under `~/.cursor/projects/<slug>/`, a path `CURSOR_CONFIG_DIR` does not relocate, so an approval granted by an earlier run persists.
 
 Edit authority is separate and comes from Cursor's agent mode, which is granted only to a role explicitly selected with `--writer`. Agent mode and `--writer` must agree, and a mismatch in either direction is rejected before launch. Use writers only in trusted, recoverable worktrees.

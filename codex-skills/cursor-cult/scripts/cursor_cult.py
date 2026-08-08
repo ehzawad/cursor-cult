@@ -580,6 +580,16 @@ def write_role_cursor_config(
     # Stop a worker rewriting the very file that constrains it. realpath matters: the
     # resolver compares resolved paths, and on macOS $TMPDIR resolves through /private.
     deny.append(f"Write({os.path.realpath(config_dir)}/**)")
+    # And deny the whole state root, to EVERY role including an authorized writer. A
+    # writer has unrestricted Write authority over the worktree, and the state root's
+    # 0700 mode only keeps out other OS users — not a worker running as this user. That
+    # left `runs/<id>/config.json` writable by a worker, and a supervisor reads
+    # `cursor_bin`, `writer_ids`, `project_root`, roles, and context back out of it. A
+    # tampered `cursor_bin` was demonstrated to make a later supervisor launch every
+    # role through a substituted executable, which no capability re-probe can detect
+    # because the probe runs against the substituted binary. Closing the write is the
+    # only fix that actually holds; a writer has no business editing run state anyway.
+    deny.append(f"Write({os.path.realpath(state_root())}/**)")
 
     # Operator entries lead, generated denies follow. Deny outranks allow in Cursor, so
     # a broad operator allow cannot defeat the generated reader boundary — verified
@@ -669,79 +679,83 @@ def find_cursor_cli(explicit: str | None = None) -> str:
     )
 
 
-def probe_flag_accepted(cli: str, env: dict[str, str], flag: str) -> bool:
-    """Detect a Cursor CLI option by invoking it, never by reading `--help`.
-
-    Cursor registers `--disable-project-configs` with Commander's `.hideHelp()`, so it is
-    absent from `--help` on every build that has it — by construction, not by version. A
-    help-text probe for it is therefore permanently false, and gating launch on one makes
-    the whole tool refuse to run against a CLI that supports the flag perfectly well.
-
-    `--help` and `--version` are equally useless as probes in the other direction: both
-    short-circuit before Commander validates options, so `cursor-agent --any-nonsense
-    --help` exits 0. A probe built on either reports every imaginable flag as supported.
-
-    `mcp list` is the cheapest subcommand that does parse options (~0.4s, no auth
-    round-trip, no model call). It runs in an empty scratch directory on purpose: Cursor
-    reads the project `.cursor/cli.json` before validating options, so in a repository
-    holding a malformed one the error becomes "Failed reading project .cursor/cli.json"
-    and the unknown-option signal disappears entirely. Probing the project root would
-    then read a *rejected* flag as accepted.
-
-    Positive evidence only. A timeout, an OSError, or any non-zero exit means unsupported,
-    so an unreadable answer fails closed instead of silently dropping a boundary.
-    """
-    try:
-        with tempfile.TemporaryDirectory() as neutral:
-            probe = subprocess.run(
-                [cli, flag, "mcp", "list"],
-                cwd=neutral,
-                env=env,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=30,
-                check=False,
-            )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return probe.returncode == 0 and "unknown option" not in probe.stdout
+def _run_cursor(cli: str, args: Sequence[str], cwd: Path, env: dict[str, str]):
+    return subprocess.run(
+        [cli, *args],
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=30,
+        check=False,
+    )
 
 
 def run_cursor_probe(cli: str, cwd: Path) -> tuple[CursorCapabilities, str]:
-    env = sanitized_cursor_env()
-    try:
-        status = subprocess.run(
-            [cli, "status"],
-            cwd=cwd,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise UsageError(f"failed to check Cursor CLI authentication: {exc}") from exc
-    if status.returncode != 0:
-        detail = status.stdout.strip()[-2000:]
-        raise UsageError(
-            "Cursor CLI is not authenticated. Run `cursor-agent login` and verify with "
-            f"`cursor-agent status`. Details: {detail or 'status failed'}"
-        )
+    """Authenticate and detect capabilities in one pass.
 
+    `--disable-project-configs` cannot be detected from `--help`: Cursor registers it with
+    Commander's `.hideHelp()`, so it is absent from help output on every build that has it
+    — by construction, not by version. Gating launch on a help-text match therefore refuses
+    every launch against a CLI that supports the flag perfectly well.
+
+    `--help` and `--version` are useless in the other direction too: both short-circuit
+    before Commander validates options, so `cursor-agent --any-nonsense --help` exits 0.
+    A probe built on either reports every imaginable flag as supported.
+
+    So the flag rides along on the authentication check that already runs. That costs no
+    extra process on the common path, and it deliberately avoids two traps:
+
+      * A separate probe in a scratch cwd breaks a relative `--cursor-bin`, which resolves
+        against the project directory.
+      * `mcp list` looks like a cheap option-parsing subcommand but actually starts or
+        contacts configured MCP servers. A user-level `~/.cursor/mcp.json` pointing at a
+        hung server turned that probe into a 30-second timeout reported as "the CLI
+        rejected the flag" — the exact false-negative brick this design exists to avoid —
+        and orphaned the server's child process.
+
+    Running the flagged call *first* also repairs a pre-existing failure: an unflagged
+    `status` in a repository holding a malformed `.cursor/cli.json` exits non-zero, which
+    was surfaced as a bogus authentication error. With the flag, that file is not read.
+
+    Discrimination is behavioural, not string-matched against a vendor error message:
+    flagged succeeds -> supported; flagged fails but plain succeeds -> the flag is what
+    broke it; both fail -> a genuine authentication failure.
+    """
+    env = sanitized_cursor_env()
+
+    def status_call(args: Sequence[str]):
+        try:
+            return _run_cursor(cli, args, cwd, env)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise UsageError(
+                f"failed to check Cursor CLI authentication: {exc}"
+            ) from exc
+
+    flagged = status_call(["--disable-project-configs", "status"])
+    if flagged.returncode == 0:
+        supports_disable_project_configs = True
+        status = flagged
+    else:
+        plain = status_call(["status"])
+        # Positive evidence only: the capability is claimed just when removing the flag
+        # is what made the call work. Anything else fails closed.
+        supports_disable_project_configs = False
+        status = plain
+        if plain.returncode != 0:
+            detail = plain.stdout.strip()[-2000:]
+            raise UsageError(
+                "Cursor CLI is not authenticated. Run `cursor-agent login` and verify "
+                f"with `cursor-agent status`. Details: {detail or 'status failed'}"
+            )
+
+    help_args = ["--help"]
+    if supports_disable_project_configs:
+        # Keep a repository config from breaking the help probe too.
+        help_args = ["--disable-project-configs", "--help"]
     try:
-        help_result = subprocess.run(
-            [cli, "--help"],
-            cwd=cwd,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=30,
-            check=False,
-        )
-        help_text = help_result.stdout
+        help_text = _run_cursor(cli, help_args, cwd, env).stdout
     except (OSError, subprocess.TimeoutExpired):
         help_text = ""
 
@@ -752,9 +766,7 @@ def run_cursor_probe(cli: str, cwd: Path) -> tuple[CursorCapabilities, str]:
         supports_force="--force" in help_text or not help_text,
         supports_trust="--trust" in help_text or not help_text,
         supports_approve_mcps="--approve-mcps" in help_text or not help_text,
-        supports_disable_project_configs=probe_flag_accepted(
-            cli, env, "--disable-project-configs"
-        ),
+        supports_disable_project_configs=supports_disable_project_configs,
     )
     return capabilities, status.stdout.strip()
 
@@ -1360,6 +1372,11 @@ async def execute_fleet(
         if progress:
             progress(role.id, None)
         try:
+            # Re-checked per role rather than only at preflight. An authorized writer
+            # shares the worktree and can create `.cursor/mcp.json` after validation but
+            # before a later reader reaches its semaphore slot; with a persisted approval
+            # that manifest would then spawn for the reader. Cheap: one stat per role.
+            validate_project_mcp_isolation(root, [role], writer_ids, allow_project_mcp)
             result = await execute_role(
                 cli=cli,
                 root=root,
@@ -2509,6 +2526,10 @@ def command_check(ns: argparse.Namespace) -> int:
     # gates. Validating a fleet here that `run` would then refuse is worse than useless.
     validate_project_config_isolation(capabilities)
     validate_project_mcp_isolation(root, roles, writer_ids, ns.allow_project_mcp)
+    # `run` reads the operator config while materializing each role's config, so an
+    # unreadable or malformed one fails every role at launch. Preflight has to hit the
+    # same code path or it reports a fleet as validated that `run` then refuses.
+    load_operator_cursor_config()
     notice = agent_mode_notice(roles, writer_ids, execution="validated fleet")
     payload = {
         "ok": True,
