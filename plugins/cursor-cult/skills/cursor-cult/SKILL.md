@@ -75,6 +75,14 @@ Select the mode per role from the user's current intent, authority, live evidenc
 
 Cursor accepts only `ask` and `plan` as explicit `--mode` values, so the runner selects agent mode by omitting `--mode`. `agent` is rejected unless that same role is passed as `--writer`.
 
+Mode and tool access are separate decisions. When Cursor exposes native web/search tools, they use a different capability path from shell. When a read-only role must run `git`, `curl`, `gh`, a package manager, tests, or another terminal command, isolate that role in its own fleet invocation and add `--readonly-shell` to the matching `run` or `start`. Do not enable it for a mixed fleet merely because one role wants the network: the flag removes Cursor Cult's explicit `Shell(*)` deny for every `ask`/`plan` role in that invocation, and shell remains a write vector even when the role is described as read-only. If the task actually authorizes local mutation, use one `agent` writer plus `--writer` instead of weakening a reader.
+
+`--readonly-shell` removes only Cursor Cult's own blanket shell deny. The runner accepts it only for one isolated `ask`/`plan` role, and preserves narrower operator deny rules; shell can still mutate. It does not disable Cursor's OS sandbox, change Cursor's network-access mode, bypass an enterprise allow/deny policy, or guarantee egress. Cursor Cult preserves the operator's global permission arrays and passes `--disable-project-configs` so repository `.cursor/cli.json` cannot replace them. This deliberately ignores that project CLI file for workers; required settings from it must be moved to the operator config or supplied explicitly. A CLI without the isolation capability is refused.
+
+Cursor Cult's detached `start` is a local process supervisor that ultimately executes the same headless `cursor-agent -p` path as foreground `run`; it is not `cursor-agent --background` and not Cursor's remote Background Agents product. An authorized agent writer already receives the runner's strongest documented local CLI path (`--force`, with agent mode selected by omitting `--mode`); `--yolo` is not a separate escape hatch, and neither flag overrides an explicit deny.
+
+Effective authority is the intersection of the operating system or outer container, Claude Code's sandbox and network policy, Cursor CLI permissions, and this role contract. A nested worker cannot widen the parent boundary with `--force`, `--background`, detachment, `nohup`, or `setsid`.
+
 ## 4. Preserve workspace safety
 
 In one worktree, authorize at most one writer per fleet invocation. Other workers remain read-only. Multiple writers require separate worktrees and separate invocations.
@@ -83,9 +91,21 @@ A writer may change the local worktree only within the capsule. It must not comm
 
 ## 5. Stage and run
 
-`${CLAUDE_SKILL_DIR}` is this skill directory and contains the bundled runner. Create a private staging directory, write `roles.json` and `context.md`, and preflight:
+`${CLAUDE_SKILL_DIR}` is this skill directory and contains the bundled runner. Create a private staging directory, write `roles.json` and `context.md`, and preflight.
 
-The runner derives a host-session key by checking, in order, `CURSOR_CULT_SESSION_KEY`, `CLAUDE_CODE_REMOTE_SESSION_ID`, `CLAUDE_SESSION_ID`, `CODEX_THREAD_ID`, terminal/editor fallbacks, and finally the literal `project`. Two consequences matter. Keys are prefixed by the variable that produced them, so a launcher and a monitor that read *different* variables derive different keys and the monitor silently sees no runs. And when none is set, every session in one project shares the `project` key, so concurrent sessions observe each other's runs. `watch-all` always filters by canonical project root, so runs never cross project boundaries. Pass `CURSOR_CULT_SESSION_KEY` explicitly — the same value to the runner and the watcher — whenever session isolation actually matters.
+The runner persists run journals, role sessions, and generated per-role Cursor configuration under `${XDG_STATE_HOME:-$HOME/.local/state}/cursor-cult`, which is normally outside the project. Before launching a fleet, resolve that path, create it privately, and verify the current Claude Code sandbox can write it:
+
+```zsh
+STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/cursor-cult"
+mkdir -p "$STATE_ROOT"
+chmod 700 "$STATE_ROOT"
+```
+
+If this fails under Claude Code's sandbox, grant the resolved path through `sandbox.filesystem.allowWrite` before retrying. Network capability is independent: allow the required task endpoints and the Cursor service domains reported by sandbox diagnostics through `sandbox.network.allowedDomains`. Prefer these narrow grants over broadly excluding `python3` or disabling the whole sandbox.
+
+When an isolated read-only invocation explicitly needs terminal commands, append `--readonly-shell` to `check` and to the matching `run` or `start`. `check` validates that the fleet is one isolated ask/plan role and reports `readonly_shell: true`; it does not launch a worker or prove shell/network availability. Never validate one permission profile and execute another.
+
+The runner derives a host-session key by checking, in order, `CURSOR_CULT_SESSION_KEY`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_REMOTE_SESSION_ID`, `CLAUDE_SESSION_ID`, `CODEX_THREAD_ID`, terminal/editor fallbacks, and finally the literal `project`. Two consequences matter. Keys are prefixed by the variable that produced them, so a launcher and a monitor that read *different* variables derive different keys and the monitor silently sees no runs. And when none is set, every session in one project shares the `project` key, so concurrent sessions observe each other's runs. `watch-all` always filters by canonical project root, so runs never cross project boundaries. Pass `CURSOR_CULT_SESSION_KEY` explicitly — the same value to the runner and the watcher — whenever session isolation actually matters.
 
 ```zsh
 RUN="$(mktemp -d "${TMPDIR:-/tmp}/cursor-cult.XXXXXX")"

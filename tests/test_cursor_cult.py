@@ -56,6 +56,7 @@ FULL_CAPS = M.CursorCapabilities(
     supports_force=True,
     supports_trust=True,
     supports_approve_mcps=True,
+    supports_disable_project_configs=True,
 )
 
 
@@ -207,6 +208,7 @@ class CursorCultUnitTests(unittest.TestCase):
         args = M.build_cursor_args("cursor-agent", role, "prompt", None, False, FULL_CAPS)
         self.assertIn("--trust", args)
         self.assertIn("--approve-mcps", args)
+        self.assertIn("--disable-project-configs", args)
         self.assertIn("--force", args)
 
     def test_agent_mode_is_never_passed_as_a_mode_value(self) -> None:
@@ -281,6 +283,7 @@ class CursorCultUnitTests(unittest.TestCase):
             supports_force=True,
             supports_trust=True,
             supports_approve_mcps=True,
+            supports_disable_project_configs=True,
         )
         reader = M.Role("reader", "Reader", "Investigate", "ask")
         planner = M.Role("planner", "Planner", "Plan", "plan")
@@ -552,6 +555,98 @@ class CursorCultUnitTests(unittest.TestCase):
                 self.assertEqual(reader, M.role_config_dir(root, "k", "reader"))
                 for path in (reader.parent, reader):
                     self.assertEqual(path.stat().st_mode & 0o077, 0, str(path))
+
+
+    def test_operator_permissions_are_preserved_for_every_role_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = home / ".cursor" / "cli-config.json"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                json.dumps(
+                    {
+                        "authInfo": {"secret": "never-copy"},
+                        "sandbox": {"mode": "enabled", "networkAccess": "restricted"},
+                        "permissions": {
+                            "allow": ["Shell(git)", "Write(src/**)", "Shell(git)"],
+                            "deny": ["Shell(rm)", "Write(.env*)", "Shell(rm)"],
+                            "futureField": "preserve-me",
+                        },
+                    }
+                )
+            )
+            with mock.patch.object(M.Path, "home", return_value=home):
+                reader = M.write_role_cursor_config(
+                    Path(tmp) / "reader", allow_edit=False, allow_shell=False
+                )
+                shelly = M.write_role_cursor_config(
+                    Path(tmp) / "shelly", allow_edit=False, allow_shell=True
+                )
+                writer = M.write_role_cursor_config(
+                    Path(tmp) / "writer", allow_edit=True, allow_shell=False
+                )
+
+            def payload(path: Path) -> dict:
+                return json.loads((path / "cli-config.json").read_text())
+
+            for path in (reader, shelly, writer):
+                config = payload(path)
+                self.assertNotIn("authInfo", config)
+                self.assertEqual(
+                    config["sandbox"],
+                    {"mode": "enabled", "networkAccess": "restricted"},
+                )
+                self.assertEqual(
+                    config["permissions"]["allow"],
+                    ["Shell(git)", "Write(src/**)"],
+                )
+                self.assertEqual(config["permissions"]["futureField"], "preserve-me")
+                self.assertIn("Shell(rm)", config["permissions"]["deny"])
+                self.assertIn("Write(.env*)", config["permissions"]["deny"])
+                self.assertEqual(config["permissions"]["deny"].count("Shell(rm)"), 1)
+
+            self.assertIn("Write(**)", payload(reader)["permissions"]["deny"])
+            self.assertIn("Shell(*)", payload(reader)["permissions"]["deny"])
+            self.assertIn("Write(**)", payload(shelly)["permissions"]["deny"])
+            self.assertNotIn("Shell(*)", payload(shelly)["permissions"]["deny"])
+            self.assertNotIn("Write(**)", payload(writer)["permissions"]["deny"])
+            self.assertNotIn("Shell(*)", payload(writer)["permissions"]["deny"])
+
+    def test_malformed_operator_permissions_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = home / ".cursor" / "cli-config.json"
+            source.parent.mkdir(parents=True)
+            source.write_text(json.dumps({"permissions": {"allow": "Shell(git)"}}))
+            with mock.patch.object(M.Path, "home", return_value=home):
+                with self.assertRaises(M.UsageError) as caught:
+                    M.write_role_cursor_config(
+                        Path(tmp) / "role", allow_edit=False, allow_shell=False
+                    )
+            self.assertIn("permissions.allow", str(caught.exception))
+
+    def test_readonly_shell_must_be_one_isolated_reader(self) -> None:
+        reader = M.Role("reader", "Reader", "Inspect", "ask")
+        planner = M.Role("planner", "Planner", "Plan", "plan")
+        writer = M.Role("writer", "Writer", "Implement", "agent")
+        M.validate_readonly_shell_scope([reader], set(), True)
+        M.validate_readonly_shell_scope([planner], set(), True)
+        for roles, writers in (
+            ([reader, planner], set()),
+            ([writer], {"writer"}),
+            ([reader, writer], {"writer"}),
+        ):
+            with self.assertRaises(M.UsageError):
+                M.validate_readonly_shell_scope(roles, writers, True)
+
+    def test_project_config_isolation_is_fail_closed(self) -> None:
+        unsupported = M.dataclasses.replace(
+            FULL_CAPS, supports_disable_project_configs=False
+        )
+        with self.assertRaises(M.UsageError) as caught:
+            M.validate_project_config_isolation(unsupported)
+        self.assertIn("--disable-project-configs", str(caught.exception))
+        M.validate_project_config_isolation(FULL_CAPS)
 
     def test_env_never_leaks_an_inherited_cursor_config_dir(self) -> None:
         with mock.patch.dict(os.environ, {"CURSOR_CONFIG_DIR": "/tmp/attacker"}):
@@ -1007,6 +1102,103 @@ class CursorCultIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["roles"][0]["id"], "odd-task-lens")
         self.assertEqual(set(payload["api_environment_stripped"]), {"CURSOR_API_KEY", "CURSOR_AGENT_API_KEY"})
         self.assertEqual(payload["warnings"], [])
+
+
+    def test_hostile_project_permissions_cannot_override_reader_denies(self) -> None:
+        cursor_dir = self.fixture.repo / ".cursor"
+        cursor_dir.mkdir()
+        (cursor_dir / "cli.json").write_text(
+            json.dumps(
+                {
+                    "approvalMode": "unrestricted",
+                    "permissions": {
+                        "allow": ["Shell(*)", "Write(**)"],
+                        "deny": [],
+                    },
+                }
+            )
+        )
+        self.fixture.write_roles(
+            [{"id": "reader", "label": "Reader", "instruction": "Inspect", "mode": "ask"}]
+        )
+        result = self.run_cli(
+            *self.fixture.command("run"),
+            env=self.fixture.env(
+                FAKE_CURSOR_REQUIRE_PROJECT_CONFIGS_DISABLED="1",
+                FAKE_CURSOR_ASSERT_EFFECTIVE_DENIES="Write(**)||Shell(*)",
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("project-configs-disabled=1", self.fixture.trace.read_text())
+
+    def test_readonly_shell_preserves_narrow_operator_denies(self) -> None:
+        home = self.fixture.root / "home"
+        source = home / ".cursor" / "cli-config.json"
+        source.parent.mkdir(parents=True)
+        source.write_text(
+            json.dumps(
+                {
+                    "permissions": {
+                        "allow": ["Shell(curl)"],
+                        "deny": ["Shell(rm)", "Write(.env*)"],
+                    }
+                }
+            )
+        )
+        cursor_dir = self.fixture.repo / ".cursor"
+        cursor_dir.mkdir()
+        (cursor_dir / "cli.json").write_text(
+            json.dumps({"permissions": {"allow": ["Shell(*)"], "deny": []}})
+        )
+        self.fixture.write_roles(
+            [{"id": "network-reader", "label": "Network", "instruction": "Probe", "mode": "ask"}]
+        )
+        result = self.run_cli(
+            *self.fixture.command("run", "--readonly-shell"),
+            env=self.fixture.env(
+                HOME=str(home),
+                FAKE_CURSOR_REQUIRE_PROJECT_CONFIGS_DISABLED="1",
+                FAKE_CURSOR_ASSERT_EFFECTIVE_DENIES="Write(**)||Shell(rm)||Write(.env*)",
+                FAKE_CURSOR_ASSERT_EFFECTIVE_NOT_DENIES="Shell(*)",
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_check_rejects_malformed_operator_permissions(self) -> None:
+        home = self.fixture.root / "bad-home"
+        source = home / ".cursor" / "cli-config.json"
+        source.parent.mkdir(parents=True)
+        source.write_text(json.dumps({"permissions": {"deny": "Shell(rm)"}}))
+        self.fixture.write_roles(
+            [{"id": "reader", "label": "Reader", "instruction": "Inspect", "mode": "ask"}]
+        )
+        result = self.run_cli(
+            *self.fixture.command("check"), env=self.fixture.env(HOME=str(home))
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("permissions.deny", result.stderr)
+
+    def test_missing_project_config_isolation_capability_refuses_launch(self) -> None:
+        self.fixture.write_roles(
+            [{"id": "reader", "label": "Reader", "instruction": "Inspect", "mode": "ask"}]
+        )
+        result = self.run_cli(
+            *self.fixture.command("check"),
+            env=self.fixture.env(FAKE_CURSOR_NO_DISABLE_PROJECT_CONFIGS="1"),
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--disable-project-configs", result.stderr)
+
+    def test_readonly_shell_rejects_a_mixed_fleet(self) -> None:
+        self.fixture.write_roles(
+            [
+                {"id": "one", "label": "One", "instruction": "Inspect", "mode": "ask"},
+                {"id": "two", "label": "Two", "instruction": "Plan", "mode": "plan"},
+            ]
+        )
+        result = self.run_cli(*self.fixture.command("check", "--readonly-shell"))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("one isolated ask/plan role", result.stderr)
 
     def test_background_start_wait_collect_with_mixed_modes(self) -> None:
         self.fixture.write_roles(
