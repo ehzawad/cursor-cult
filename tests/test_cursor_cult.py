@@ -312,6 +312,68 @@ class CursorCultUnitTests(unittest.TestCase):
             caps, _ = M.run_cursor_probe(str(FAKE), project)
             self.assertTrue(caps.supports_disable_project_configs)
 
+    def test_logged_out_cli_is_detected_despite_a_zero_exit(self) -> None:
+        """`cursor-agent status` exits 0 while logged out.
+
+        It prints "Not logged in" and returns success, so the exit code cannot be the
+        authentication signal. Preflight previously reported `ok: true` for a logged-out
+        CLI and the fleet then failed at launch.
+        """
+        self.assertIs(
+            M.cursor_status_is_authenticated(
+                json.dumps({"status": "unauthenticated", "isAuthenticated": False})
+            ),
+            False,
+        )
+        self.assertIs(
+            M.cursor_status_is_authenticated(
+                json.dumps({"status": "authenticated", "isAuthenticated": True})
+            ),
+            True,
+        )
+        self.assertIs(M.cursor_status_is_authenticated("Not logged in"), False)
+        self.assertIs(
+            M.cursor_status_is_authenticated("✓ Logged in as someone@example.com"), True
+        )
+        # An unrecognized answer must not invent a failure.
+        self.assertIsNone(M.cursor_status_is_authenticated("something unexpected"))
+        self.assertIsNone(M.cursor_status_is_authenticated(json.dumps({"other": 1})))
+
+    def test_state_root_inside_the_project_is_refused(self) -> None:
+        """The state-root deny would otherwise swallow a writer's own worktree."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "cursor-cult"
+            project.mkdir()
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": tmp}, clear=False):
+                # state_root() becomes <tmp>/cursor-cult == the project root.
+                with self.assertRaises(M.UsageError) as ctx:
+                    M.validate_state_root_separation(project)
+                self.assertIn("state root", str(ctx.exception))
+            outside = Path(tmp) / "state"
+            outside.mkdir()
+            with mock.patch.dict(
+                os.environ, {"XDG_STATE_HOME": str(outside)}, clear=False
+            ):
+                M.validate_state_root_separation(project)
+
+    def test_mcp_recheck_happens_after_the_semaphore(self) -> None:
+        """A pre-semaphore check does not close the writer-creates-manifest race.
+
+        Every queued task reaches a pre-semaphore check at once, so a writer holding the
+        only slot can create `.cursor/mcp.json` and the reader behind it has already
+        passed. Verified externally: five of five `--max-parallel 1` runs had the reader
+        launch with the manifest present. The guard therefore lives inside the
+        `async with semaphore:` block in execute_role.
+        """
+        source = Path(M.__file__).read_text(encoding="utf-8")
+        body = source.split("async def execute_role(", 1)[1]
+        after_semaphore = body.split("async with semaphore:", 1)[1]
+        guard = "validate_project_mcp_isolation(root, [role], set(), allow_project_mcp)"
+        self.assertIn(guard, after_semaphore)
+        # And it must not have been left behind in the pre-semaphore dispatcher.
+        dispatch = source.split("async def run_one(", 1)[1].split("await execute_role(", 1)[0]
+        self.assertNotIn("validate_project_mcp_isolation", dispatch)
+
     def test_supervisor_takes_its_binary_from_argv_not_run_state(self) -> None:
         """A tampered `config.json` must not choose the worker executable.
 

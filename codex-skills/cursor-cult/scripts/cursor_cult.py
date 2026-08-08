@@ -682,6 +682,44 @@ def find_cursor_cli(explicit: str | None = None) -> str:
     )
 
 
+def cursor_status_is_authenticated(output: str) -> bool | None:
+    """Read a login verdict out of `cursor-agent status`; None when undeterminable.
+
+    The exit code is useless for this: a logged-out CLI prints "Not logged in" and still
+    exits 0, so preflight reported a validated fleet that then failed at launch. Prefer
+    `--format json`'s `isAuthenticated`, fall back to the text wording, and return None
+    rather than guessing — an unrecognized answer must not invent a failure.
+    """
+    with contextlib.suppress(ValueError):
+        payload = json.loads(output)
+        if isinstance(payload, dict) and isinstance(payload.get("isAuthenticated"), bool):
+            return payload["isAuthenticated"]
+    lowered = output.lower()
+    if "not logged in" in lowered:
+        return False
+    if "logged in" in lowered:
+        return True
+    return None
+
+
+def summarize_cursor_status(output: str) -> str:
+    """Render a one-line login summary, without spreading the raw identity payload.
+
+    `status --format json` answers the authentication question reliably but carries the
+    account's email, numeric id, and name. That gets echoed by `check` and persisted in
+    run state, so reduce it to the same shape the text form already produced.
+    """
+    with contextlib.suppress(ValueError):
+        payload = json.loads(output)
+        if isinstance(payload, dict) and "isAuthenticated" in payload:
+            if not payload.get("isAuthenticated"):
+                return "Not logged in"
+            info = payload.get("userInfo")
+            email = info.get("email") if isinstance(info, dict) else None
+            return f"Logged in as {email}" if email else "Logged in"
+    return output.strip()
+
+
 def _run_cursor(cli: str, args: Sequence[str], cwd: Path, env: dict[str, str]):
     return subprocess.run(
         [cli, *args],
@@ -736,22 +774,40 @@ def run_cursor_probe(cli: str, cwd: Path) -> tuple[CursorCapabilities, str]:
                 f"failed to check Cursor CLI authentication: {exc}"
             ) from exc
 
-    flagged = status_call(["--disable-project-configs", "status"])
-    if flagged.returncode == 0:
+    # One call answers both questions on a current CLI. `status` exits 0 even when
+    # logged out — it prints "Not logged in" and returns success — so the exit code
+    # cannot be the authentication signal; `--format json` carries `isAuthenticated`.
+    # The extra calls below only run when that combination is rejected, and exist to
+    # keep the two capabilities from being conflated: a CLI missing `--format` must not
+    # be reported as missing `--disable-project-configs`.
+    status = status_call(["--disable-project-configs", "status", "--format", "json"])
+    if status.returncode == 0:
         supports_disable_project_configs = True
-        status = flagged
     else:
-        plain = status_call(["status"])
-        # Positive evidence only: the capability is claimed just when removing the flag
-        # is what made the call work. Anything else fails closed.
-        supports_disable_project_configs = False
-        status = plain
-        if plain.returncode != 0:
-            detail = plain.stdout.strip()[-2000:]
-            raise UsageError(
-                "Cursor CLI is not authenticated. Run `cursor-agent login` and verify "
-                f"with `cursor-agent status`. Details: {detail or 'status failed'}"
-            )
+        flagged_text = status_call(["--disable-project-configs", "status"])
+        if flagged_text.returncode == 0:
+            supports_disable_project_configs = True
+            status = flagged_text
+        else:
+            plain_json = status_call(["status", "--format", "json"])
+            # Positive evidence only: the capability is claimed just when removing the
+            # flag is what made the call work. Anything else fails closed.
+            supports_disable_project_configs = False
+            status = plain_json
+            if plain_json.returncode != 0:
+                status = status_call(["status"])
+    if status.returncode != 0:
+        detail = status.stdout.strip()[-2000:]
+        raise UsageError(
+            "Cursor CLI is not authenticated. Run `cursor-agent login` and verify "
+            f"with `cursor-agent status`. Details: {detail or 'status failed'}"
+        )
+    if cursor_status_is_authenticated(status.stdout) is False:
+        raise UsageError(
+            "Cursor CLI is not logged in. `cursor-agent status` reports no session "
+            "(it exits 0 either way, so the exit code does not say so). Run "
+            "`cursor-agent login`."
+        )
 
     help_args = ["--help"]
     if supports_disable_project_configs:
@@ -771,7 +827,7 @@ def run_cursor_probe(cli: str, cwd: Path) -> tuple[CursorCapabilities, str]:
         supports_approve_mcps="--approve-mcps" in help_text or not help_text,
         supports_disable_project_configs=supports_disable_project_configs,
     )
-    return capabilities, status.stdout.strip()
+    return capabilities, summarize_cursor_status(status.stdout)
 
 
 def build_prompt(role: Role, context: str, allow_edit: bool) -> str:
@@ -1064,8 +1120,17 @@ async def execute_role(
     registry: ActiveProcessRegistry,
     role_log_dir: Path | None,
     allow_readonly_shell: bool = False,
+    allow_project_mcp: bool = False,
 ) -> RoleResult:
     async with semaphore:
+        # Checked here, after the slot is acquired and immediately before this worker
+        # launches — not at preflight, and not before the semaphore. Every queued task
+        # reaches a pre-semaphore check at once, so a writer that creates
+        # `.cursor/mcp.json` while holding the only slot would still be followed by a
+        # reader that had already passed. Verified: five of five runs with
+        # --max-parallel 1 had the reader launch with the manifest present.
+        if not allow_edit:
+            validate_project_mcp_isolation(root, [role], set(), allow_project_mcp)
         session_path = role_state_path(root, session_key, role.id)
         lock_path = session_path.with_suffix(".lock")
         # Written under the same lock that serializes this role's session, and keyed
@@ -1276,6 +1341,27 @@ def validate_project_config_isolation(capabilities: CursorCapabilities) -> None:
     )
 
 
+def validate_state_root_separation(root: Path) -> None:
+    """Refuse a state root that overlaps the worktree.
+
+    Every role denies writes under the state root. If `XDG_STATE_HOME` places that root
+    inside — or equal to — the project, the deny swallows the worktree and an authorized
+    writer silently cannot edit the files it was appointed to edit. Reached in the real
+    configuration where `XDG_STATE_HOME` is the project's parent and the project is named
+    `cursor-cult`. Refusing is better than a writer that reports success having written
+    nothing.
+    """
+    state = Path(os.path.realpath(state_root()))
+    project = Path(os.path.realpath(root))
+    if state == project or project.is_relative_to(state):
+        raise UsageError(
+            f"the Cursor Cult state root ({state}) contains or equals the project root "
+            f"({project}). Every role denies writes under the state root, so this would "
+            "silently strip an authorized writer of its worktree. Set XDG_STATE_HOME to "
+            "a location outside the project."
+        )
+
+
 def validate_project_mcp_isolation(
     root: Path, roles: Sequence[Role], writer_ids: set[str], allow_project_mcp: bool
 ) -> None:
@@ -1364,6 +1450,7 @@ async def execute_fleet(
     # Re-validated here rather than only at the CLI boundary because `_supervise`
     # rehydrates a detached run straight into this function.
     validate_project_config_isolation(capabilities)
+    validate_state_root_separation(root)
     validate_project_mcp_isolation(root, roles, writer_ids, allow_project_mcp)
 
     if role_log_dir is not None:
@@ -1375,11 +1462,6 @@ async def execute_fleet(
         if progress:
             progress(role.id, None)
         try:
-            # Re-checked per role rather than only at preflight. An authorized writer
-            # shares the worktree and can create `.cursor/mcp.json` after validation but
-            # before a later reader reaches its semaphore slot; with a persisted approval
-            # that manifest would then spawn for the reader. Cheap: one stat per role.
-            validate_project_mcp_isolation(root, [role], writer_ids, allow_project_mcp)
             result = await execute_role(
                 cli=cli,
                 root=root,
@@ -1394,6 +1476,7 @@ async def execute_fleet(
                 registry=registry,
                 role_log_dir=role_log_dir,
                 allow_readonly_shell=allow_readonly_shell,
+                allow_project_mcp=allow_project_mcp,
             )
         except asyncio.CancelledError:
             raise
@@ -2469,6 +2552,7 @@ async def command_run(ns: argparse.Namespace) -> int:
     validate_write_authority(roles, writer_ids)
     validate_read_only_capability(roles, capabilities)
     validate_project_config_isolation(capabilities)
+    validate_state_root_separation(root)
     validate_project_mcp_isolation(root, roles, writer_ids, ns.allow_project_mcp)
     emit_agent_mode_notice(roles, writer_ids, execution="foreground run")
     registry = ActiveProcessRegistry()
@@ -2532,6 +2616,7 @@ def command_check(ns: argparse.Namespace) -> int:
     # `check` is the preflight for `run`/`start`, so it must apply the same containment
     # gates. Validating a fleet here that `run` would then refuse is worse than useless.
     validate_project_config_isolation(capabilities)
+    validate_state_root_separation(root)
     validate_project_mcp_isolation(root, roles, writer_ids, ns.allow_project_mcp)
     # `run` reads the operator config while materializing each role's config, so an
     # unreadable or malformed one fails every role at launch. Preflight has to hit the
@@ -2567,6 +2652,7 @@ def command_start(ns: argparse.Namespace) -> int:
     validate_write_authority(roles, writer_ids)
     validate_read_only_capability(roles, capabilities)
     validate_project_config_isolation(capabilities)
+    validate_state_root_separation(root)
     validate_project_mcp_isolation(root, roles, writer_ids, ns.allow_project_mcp)
     if ns.heartbeat_seconds <= 0:
         raise UsageError("--heartbeat-seconds must be positive")
