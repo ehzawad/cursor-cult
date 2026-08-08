@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 DONE_SENTINEL = "CURSOR_CULT_DONE"
 # readline() raises LimitOverrunError past its 64KiB default; a large final
 # "result" event exceeds that and used to crash the fleet.
@@ -132,6 +132,7 @@ class CursorCapabilities:
     supports_force: bool
     supports_trust: bool
     supports_approve_mcps: bool
+    supports_disable_project_configs: bool
 
 
 @dataclasses.dataclass
@@ -470,6 +471,64 @@ def role_config_dir(root: Path, session_key: str, role_id: str) -> Path:
     return state_root() / "cfg" / f"{project_key}-{session_hash}__{role_id}"
 
 
+def operator_cursor_config_path() -> Path:
+    """Resolve the operator's Cursor config the way the CLI itself does.
+
+    The CLI trims these variables before testing them, so a whitespace-only
+    CURSOR_CONFIG_DIR falls through to XDG rather than resolving to the process CWD.
+    Matching that exactly matters: reading the wrong file silently drops the operator's
+    deny rules from every worker, which is the failure this function exists to prevent.
+    """
+    configured = (os.environ.get("CURSOR_CONFIG_DIR") or "").strip()
+    if configured:
+        return Path(configured) / "cli-config.json"
+    xdg = (os.environ.get("XDG_CONFIG_HOME") or "").strip()
+    if xdg:
+        return Path(xdg) / "cursor" / "cli-config.json"
+    return Path.home() / ".cursor" / "cli-config.json"
+
+
+def permission_entries(value: Any, label: str) -> list[str]:
+    """Accept only a list of non-empty strings, preserving order and de-duplicating.
+
+    Fail closed. A malformed operator array is ambiguous, and the safe reading of an
+    ambiguous authority boundary is "refuse", not "ignore the parts I could not parse".
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise UsageError(f"Cursor {label} must be a JSON array of strings")
+    entries: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or isinstance(item, bool) or not item.strip():
+            raise UsageError(f"Cursor {label} must contain only non-empty strings")
+        if item not in entries:
+            entries.append(item)
+    return entries
+
+
+def load_operator_cursor_config() -> dict[str, Any]:
+    source = operator_cursor_config_path()
+    try:
+        loaded = json.loads(source.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise UsageError(f"cannot safely read Cursor CLI config {source}: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise UsageError(f"Cursor CLI config must contain a JSON object: {source}")
+    # `or {}` would be wrong here: an empty list is falsy, and silently treating a
+    # malformed `permissions` as absent is the fail-open this function exists to stop.
+    raw = loaded.get("permissions")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise UsageError("Cursor permissions must be a JSON object")
+    permission_entries(raw.get("allow"), "permissions.allow")
+    permission_entries(raw.get("deny"), "permissions.deny")
+    return loaded
+
+
 def write_role_cursor_config(
     config_dir: Path, allow_edit: bool, allow_shell: bool
 ) -> Path:
@@ -478,12 +537,18 @@ def write_role_cursor_config(
     Cursor resolves `permissions` from its config file and documents that "deny rules
     take precedence over allow rules" — verified against the installed CLI, where a
     denied write and a denied shell command were both refused in agent mode *with*
-    `--force`. This is the only containment in the system that does not depend on the
-    undocumented question of whether `--mode` outranks `--force`.
+    `--force`, and where an operator `allow: ["Shell(*)"]` alongside a generated
+    `deny: ["Shell(*)"]` was still refused. That precedence is what makes inheriting the
+    operator's allow list safe.
 
-    The operator's own config is inherited so model choice and editor preferences are
-    preserved, but `authInfo` is never copied: a redirected config dir still
-    authenticates, so duplicating credentials into run state would be pure risk.
+    The operator's allow AND deny entries are authority boundaries, not preferences, so
+    they are carried through and the role's denies are appended. Replacing the whole
+    `permissions` object — as this function used to — silently dropped every operator
+    deny rule from every worker, which is a fail-open the operator never consented to.
+
+    `authInfo` is still stripped on the way in: a redirected config dir authenticates on
+    its own, so copying credential material into run state would be pure risk. Cursor
+    does write its own identity block back into the 0700 role directory on first use.
     """
     # 0700 on every level. Cursor persists its own material here — a `chats/` store,
     # caches, and its authentication record — because CURSOR_CONFIG_DIR redirects the
@@ -491,17 +556,20 @@ def write_role_cursor_config(
     # protects that; Cursor rewrites the files under its own umask.
     make_private_dir(config_dir)
 
-    base: dict[str, Any] = {}
-    source = Path.home() / ".cursor" / "cli-config.json"
-    with contextlib.suppress(OSError, json.JSONDecodeError):
-        loaded = json.loads(source.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            base = loaded
+    base: dict[str, Any] = load_operator_cursor_config()
     for secret in ("authInfo",):
         base.pop(secret, None)
     base["version"] = base.get("version", 1)
 
-    deny: list[str] = []
+    raw_permissions = base.get("permissions")
+    if raw_permissions is None:
+        raw_permissions = {}
+    if not isinstance(raw_permissions, dict):
+        raise UsageError("Cursor permissions must be a JSON object")
+    permissions = dict(raw_permissions)
+    allow = permission_entries(permissions.get("allow"), "permissions.allow")
+    deny = permission_entries(permissions.get("deny"), "permissions.deny")
+
     if not allow_edit:
         deny.append("Write(**)")
         if not allow_shell:
@@ -512,7 +580,13 @@ def write_role_cursor_config(
     # Stop a worker rewriting the very file that constrains it. realpath matters: the
     # resolver compares resolved paths, and on macOS $TMPDIR resolves through /private.
     deny.append(f"Write({os.path.realpath(config_dir)}/**)")
-    base["permissions"] = {"allow": [], "deny": deny}
+
+    # Operator entries lead, generated denies follow. Deny outranks allow in Cursor, so
+    # a broad operator allow cannot defeat the generated reader boundary — verified
+    # against the installed CLI, where allow Shell(*) + deny Shell(*) was refused.
+    permissions["allow"] = allow
+    permissions["deny"] = permission_entries(deny, "permissions.deny")
+    base["permissions"] = permissions
 
     atomic_write_json(config_dir / "cli-config.json", base)
     return config_dir
@@ -595,6 +669,45 @@ def find_cursor_cli(explicit: str | None = None) -> str:
     )
 
 
+def probe_flag_accepted(cli: str, env: dict[str, str], flag: str) -> bool:
+    """Detect a Cursor CLI option by invoking it, never by reading `--help`.
+
+    Cursor registers `--disable-project-configs` with Commander's `.hideHelp()`, so it is
+    absent from `--help` on every build that has it — by construction, not by version. A
+    help-text probe for it is therefore permanently false, and gating launch on one makes
+    the whole tool refuse to run against a CLI that supports the flag perfectly well.
+
+    `--help` and `--version` are equally useless as probes in the other direction: both
+    short-circuit before Commander validates options, so `cursor-agent --any-nonsense
+    --help` exits 0. A probe built on either reports every imaginable flag as supported.
+
+    `mcp list` is the cheapest subcommand that does parse options (~0.4s, no auth
+    round-trip, no model call). It runs in an empty scratch directory on purpose: Cursor
+    reads the project `.cursor/cli.json` before validating options, so in a repository
+    holding a malformed one the error becomes "Failed reading project .cursor/cli.json"
+    and the unknown-option signal disappears entirely. Probing the project root would
+    then read a *rejected* flag as accepted.
+
+    Positive evidence only. A timeout, an OSError, or any non-zero exit means unsupported,
+    so an unreadable answer fails closed instead of silently dropping a boundary.
+    """
+    try:
+        with tempfile.TemporaryDirectory() as neutral:
+            probe = subprocess.run(
+                [cli, flag, "mcp", "list"],
+                cwd=neutral,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+                check=False,
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0 and "unknown option" not in probe.stdout
+
+
 def run_cursor_probe(cli: str, cwd: Path) -> tuple[CursorCapabilities, str]:
     env = sanitized_cursor_env()
     try:
@@ -639,6 +752,9 @@ def run_cursor_probe(cli: str, cwd: Path) -> tuple[CursorCapabilities, str]:
         supports_force="--force" in help_text or not help_text,
         supports_trust="--trust" in help_text or not help_text,
         supports_approve_mcps="--approve-mcps" in help_text or not help_text,
+        supports_disable_project_configs=probe_flag_accepted(
+            cli, env, "--disable-project-configs"
+        ),
     )
     return capabilities, status.stdout.strip()
 
@@ -700,7 +816,26 @@ def build_cursor_args(
     # `--mode` was not positively detected.
     if capabilities.supports_trust:
         args.append("--trust")
-    if capabilities.supports_approve_mcps:
+    # Project `.cursor/cli.json` permission arrays REPLACE the generated global arrays
+    # rather than merging with them, so a repository can hand a nominally read-only
+    # worker `Shell(*)` and `Write(**)`. Verified end to end: with a hostile project
+    # config the worker created a file; with this flag the same attempt was denied.
+    # Missing capability is fatal, not degraded — validate_project_config_isolation()
+    # normally catches it first, so reaching here means a caller skipped validation.
+    if not capabilities.supports_disable_project_configs:
+        raise UsageError(
+            "Cursor CLI rejected --disable-project-configs, so a repository "
+            ".cursor/cli.json could replace the generated permission arrays"
+        )
+    args.append("--disable-project-configs")
+    # `--approve-mcps` auto-approves repository-defined MCP servers, which Cursor spawns
+    # as local processes before any permission rule is consulted; no generated deny gates
+    # them and --disable-project-configs does not cover .cursor/mcp.json. A reader must
+    # never carry it. Withholding it is safe in `-p` mode: unapproved servers are skipped
+    # silently and the run still exits 0 (the old "unanswered prompt exits 1" note was
+    # wrong). Approvals also persist in ~/.cursor/projects/<slug>/mcp-approvals.json,
+    # outside CURSOR_CONFIG_DIR, which is why validate_project_mcp_isolation() exists too.
+    if capabilities.supports_approve_mcps and allow_edit:
         args.append("--approve-mcps")
     if capabilities.supports_force:
         args.append("--force")
@@ -1107,6 +1242,55 @@ def validate_read_only_capability(
     )
 
 
+def validate_project_config_isolation(capabilities: CursorCapabilities) -> None:
+    """Require the switch that keeps the generated permission arrays authoritative.
+
+    A repository `.cursor/cli.json` replaces the global `permissions.allow`/`deny`
+    arrays rather than merging into them, so without this flag any checked-out project
+    can grant a read-only worker `Shell(*)` and `Write(**)`. Verified end to end: the
+    hostile-project case created a file, and the same case with the flag was denied.
+    """
+    if capabilities.supports_disable_project_configs:
+        return
+    raise UsageError(
+        "the installed Cursor CLI rejected --disable-project-configs, so a repository "
+        ".cursor/cli.json could replace the generated permission arrays and remove the "
+        "reader boundary. Cursor Cult will not launch workers it cannot contain. "
+        "Upgrade Cursor CLI (`cursor-agent update`); note the flag is intentionally "
+        "hidden from `--help`, so its absence there is normal and not the problem."
+    )
+
+
+def validate_project_mcp_isolation(
+    root: Path, roles: Sequence[Role], writer_ids: set[str], allow_project_mcp: bool
+) -> None:
+    """Refuse read-only roles in a repository that ships its own MCP servers.
+
+    Cursor spawns MCP servers as local processes before any permission rule is
+    consulted, so a `Write(**)`/`Shell(*)` deny does not contain them and
+    `--disable-project-configs` does not suppress them — it covers `.cursor/cli.json`
+    only. Withholding `--approve-mcps` prevents the first spawn, but Cursor records an
+    approval under `~/.cursor/projects/<slug>/mcp-approvals.json`, a path
+    `CURSOR_CONFIG_DIR` does not relocate, so any earlier approval keeps working.
+    A reader in such a repository therefore cannot be honestly called read-only.
+    """
+    if allow_project_mcp:
+        return
+    manifest = root / ".cursor" / "mcp.json"
+    if not manifest.exists():
+        return
+    readers = sorted(role.id for role in roles if role.id not in writer_ids)
+    if not readers:
+        return
+    raise UsageError(
+        f"{manifest} defines repository MCP servers. Cursor spawns them as local "
+        "processes before permission rules apply, and neither the generated denies nor "
+        "--disable-project-configs contain them, so these read-only roles cannot be "
+        "held read-only: " + ", ".join(readers) + ". Re-run with --allow-project-mcp to "
+        "accept that risk deliberately, or run from a worktree without .cursor/mcp.json."
+    )
+
+
 def agent_mode_notice(
     roles: Sequence[Role],
     writer_ids: set[str],
@@ -1151,6 +1335,7 @@ async def execute_fleet(
     capabilities: CursorCapabilities,
     require_login_auth: bool,
     allow_readonly_shell: bool = False,
+    allow_project_mcp: bool = False,
     role_log_dir: Path | None = None,
     progress: Callable[[str, RoleResult | None], None] | None = None,
     registry: ActiveProcessRegistry | None = None,
@@ -1161,6 +1346,10 @@ async def execute_fleet(
     effective_max_parallel = max_parallel if max_parallel > 0 else max(len(roles), 1)
     validate_write_authority(roles, writer_ids)
     validate_read_only_capability(roles, capabilities)
+    # Re-validated here rather than only at the CLI boundary because `_supervise`
+    # rehydrates a detached run straight into this function.
+    validate_project_config_isolation(capabilities)
+    validate_project_mcp_isolation(root, roles, writer_ids, allow_project_mcp)
 
     if role_log_dir is not None:
         role_log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1914,7 +2103,14 @@ async def supervise_run(run_dir: Path) -> int:
     context = read_context(run_dir / "context.md")
     root = Path(config["project_root"]).resolve()
     cli = config["cursor_bin"]
-    capabilities = CursorCapabilities(**config["capabilities"])
+    # Re-probe rather than trusting `config["capabilities"]`. The run directory lives
+    # under the state root, which a shell-capable worker from an earlier fleet can
+    # write, so a persisted capability record is attacker-influenceable input — and a
+    # forged `supports_disable_project_configs: true` is exactly the claim that would
+    # let a supervisor launch workers with the reader boundary removed. Re-probing also
+    # avoids trusting a record staged by an older release. One probe per supervised
+    # run, not per worker.
+    capabilities, _ = run_cursor_probe(cli, root)
     writer_ids = set(config.get("writer_ids", []))
     heartbeat_seconds = float(
         config.get("heartbeat_seconds", DEFAULT_HEARTBEAT_SECONDS)
@@ -2007,6 +2203,7 @@ async def supervise_run(run_dir: Path) -> int:
             capabilities=capabilities,
             require_login_auth=bool(config["require_login_auth"]),
             allow_readonly_shell=bool(config.get("allow_readonly_shell", False)),
+            allow_project_mcp=bool(config.get("allow_project_mcp", False)),
             role_log_dir=run_dir / "roles",
             progress=progress,
             registry=registry,
@@ -2134,6 +2331,13 @@ def add_execution_arguments(parser: argparse.ArgumentParser) -> None:
         "Write(**) deny does not cover; Cursor's own file-reading tools are "
         "unaffected either way.",
     )
+    parser.add_argument(
+        "--allow-project-mcp",
+        action="store_true",
+        help="run read-only roles even though the repository ships .cursor/mcp.json. "
+        "Cursor spawns those MCP servers as local processes before permission rules "
+        "apply, so the roles are not genuinely read-only. UNSAFE; opt in deliberately.",
+    )
 
 
 def default_heartbeat_seconds() -> float:
@@ -2240,6 +2444,8 @@ async def command_run(ns: argparse.Namespace) -> int:
     writer_ids = set(ns.writer)
     validate_write_authority(roles, writer_ids)
     validate_read_only_capability(roles, capabilities)
+    validate_project_config_isolation(capabilities)
+    validate_project_mcp_isolation(root, roles, writer_ids, ns.allow_project_mcp)
     emit_agent_mode_notice(roles, writer_ids, execution="foreground run")
     registry = ActiveProcessRegistry()
     loop = asyncio.get_running_loop()
@@ -2267,6 +2473,7 @@ async def command_run(ns: argparse.Namespace) -> int:
             capabilities=capabilities,
             require_login_auth=not ns.allow_non_login_auth,
             allow_readonly_shell=ns.readonly_shell,
+            allow_project_mcp=ns.allow_project_mcp,
             registry=registry,
             role_log_dir=role_log_dir,
         )
@@ -2298,6 +2505,10 @@ def command_check(ns: argparse.Namespace) -> int:
     writer_ids = set(ns.writer)
     validate_write_authority(roles, writer_ids)
     validate_read_only_capability(roles, capabilities)
+    # `check` is the preflight for `run`/`start`, so it must apply the same containment
+    # gates. Validating a fleet here that `run` would then refuse is worse than useless.
+    validate_project_config_isolation(capabilities)
+    validate_project_mcp_isolation(root, roles, writer_ids, ns.allow_project_mcp)
     notice = agent_mode_notice(roles, writer_ids, execution="validated fleet")
     payload = {
         "ok": True,
@@ -2309,6 +2520,12 @@ def command_check(ns: argparse.Namespace) -> int:
         "context_bytes": len(context.encode("utf-8")),
         "session_key": derive_session_key(ns.session_key),
         "capabilities": dataclasses.asdict(capabilities),
+        "project_configs_disabled": capabilities.supports_disable_project_configs,
+        "project_mcp_manifest": str(root / ".cursor" / "mcp.json")
+        if (root / ".cursor" / "mcp.json").exists()
+        else None,
+        "allow_project_mcp": bool(ns.allow_project_mcp),
+        "readonly_shell": bool(ns.readonly_shell),
         "api_environment_stripped": list(API_ENV_KEYS),
         "warnings": [notice] if notice else [],
     }
@@ -2321,6 +2538,8 @@ def command_start(ns: argparse.Namespace) -> int:
     writer_ids = set(ns.writer)
     validate_write_authority(roles, writer_ids)
     validate_read_only_capability(roles, capabilities)
+    validate_project_config_isolation(capabilities)
+    validate_project_mcp_isolation(root, roles, writer_ids, ns.allow_project_mcp)
     if ns.heartbeat_seconds <= 0:
         raise UsageError("--heartbeat-seconds must be positive")
     notice = emit_agent_mode_notice(
@@ -2342,6 +2561,7 @@ def command_start(ns: argparse.Namespace) -> int:
         "session_key": derive_session_key(ns.session_key),
         "require_login_auth": not ns.allow_non_login_auth,
         "allow_readonly_shell": bool(ns.readonly_shell),
+        "allow_project_mcp": bool(ns.allow_project_mcp),
         "heartbeat_seconds": float(ns.heartbeat_seconds),
         "warnings": [notice] if notice else [],
     }

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import importlib.util
 import io
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -56,6 +58,7 @@ FULL_CAPS = M.CursorCapabilities(
     supports_force=True,
     supports_trust=True,
     supports_approve_mcps=True,
+    supports_disable_project_configs=True,
 )
 
 
@@ -206,8 +209,205 @@ class CursorCultUnitTests(unittest.TestCase):
         role = M.Role("reader", "Reader", "Investigate", "ask")
         args = M.build_cursor_args("cursor-agent", role, "prompt", None, False, FULL_CAPS)
         self.assertIn("--trust", args)
-        self.assertIn("--approve-mcps", args)
         self.assertIn("--force", args)
+
+    def test_only_the_writer_auto_approves_mcp_servers(self) -> None:
+        """A reader must not auto-approve repository MCP servers.
+
+        Cursor spawns an approved MCP server as a local process before any permission
+        rule applies, so `--approve-mcps` on a read-only role hands a repository
+        arbitrary local execution that no generated deny can reach.
+        """
+        reader = M.Role("reader", "Reader", "Investigate", "ask")
+        args = M.build_cursor_args("cursor-agent", reader, "prompt", None, False, FULL_CAPS)
+        self.assertNotIn("--approve-mcps", args)
+        writer = M.Role("writer", "Writer", "Implement", "agent")
+        args = M.build_cursor_args("cursor-agent", writer, "prompt", None, True, FULL_CAPS)
+        self.assertIn("--approve-mcps", args)
+
+    def test_every_worker_disables_project_configs(self) -> None:
+        """A repository .cursor/cli.json must never replace the generated arrays."""
+        for role, allow_edit in (
+            (M.Role("reader", "Reader", "Investigate", "ask"), False),
+            (M.Role("planner", "Planner", "Plan", "plan"), False),
+            (M.Role("writer", "Writer", "Implement", "agent"), True),
+        ):
+            args = M.build_cursor_args(
+                "cursor-agent", role, "prompt", None, allow_edit, FULL_CAPS
+            )
+            self.assertIn("--disable-project-configs", args, role.id)
+        resumed = M.build_cursor_args(
+            "cursor-agent",
+            M.Role("reader", "Reader", "Investigate", "ask"),
+            "prompt",
+            "session-123",
+            False,
+            FULL_CAPS,
+        )
+        self.assertIn("--disable-project-configs", resumed)
+
+    def test_launch_is_refused_without_project_config_isolation(self) -> None:
+        """Fail closed: no isolation capability, no workers."""
+        caps = dataclasses.replace(FULL_CAPS, supports_disable_project_configs=False)
+        with self.assertRaises(M.UsageError) as ctx:
+            M.validate_project_config_isolation(caps)
+        self.assertIn("--disable-project-configs", str(ctx.exception))
+        # And the argv builder refuses too, so a caller that skips validation
+        # cannot silently launch an unprotected worker.
+        with self.assertRaises(M.UsageError):
+            M.build_cursor_args(
+                "cursor-agent",
+                M.Role("reader", "Reader", "Investigate", "ask"),
+                "prompt",
+                None,
+                False,
+                caps,
+            )
+
+    def test_capability_probe_ignores_help_text(self) -> None:
+        """The real flag is registered with .hideHelp(), so help can never prove it.
+
+        The probe must key on whether an invocation accepts the flag. A fake whose
+        `--help` omits it — exactly like the real binary — must still be detected.
+        """
+        env = dict(os.environ)
+        self.assertTrue(
+            M.probe_flag_accepted(str(FAKE), env, "--disable-project-configs")
+        )
+        self.assertFalse(M.probe_flag_accepted(str(FAKE), env, "--not-a-real-flag"))
+        legacy = dict(env, FAKE_CURSOR_LEGACY="1")
+        self.assertFalse(
+            M.probe_flag_accepted(str(FAKE), legacy, "--disable-project-configs")
+        )
+        help_text = subprocess.run(
+            [str(FAKE), "--help"], capture_output=True, text=True, check=False
+        ).stdout
+        self.assertNotIn("--disable-project-configs", help_text)
+
+    def _operator_config(self, home: Path, payload: object) -> None:
+        (home / ".cursor").mkdir(parents=True, exist_ok=True)
+        (home / ".cursor" / "cli-config.json").write_text(json.dumps(payload))
+
+    def test_operator_permissions_survive_into_every_role_config(self) -> None:
+        """Operator allow AND deny are authority boundaries, not preferences.
+
+        Replacing the whole `permissions` object silently dropped every operator deny
+        from every worker — a fail-open the operator never agreed to.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            self._operator_config(
+                home,
+                {
+                    "version": 1,
+                    "model": "keep-me",
+                    "authInfo": {"token": "must-not-be-copied"},
+                    "permissions": {
+                        "allow": ["Shell(ls)", "Shell(ls)"],
+                        "deny": ["Shell(rm)", "Write(/etc/**)"],
+                    },
+                },
+            )
+            cfg_dir = Path(tmp) / "role"
+            with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                for var in ("CURSOR_CONFIG_DIR", "XDG_CONFIG_HOME"):
+                    os.environ.pop(var, None)
+                M.write_role_cursor_config(cfg_dir, allow_edit=False, allow_shell=False)
+            written = json.loads((cfg_dir / "cli-config.json").read_text())
+
+            self.assertNotIn("authInfo", written)
+            self.assertEqual(written["model"], "keep-me")
+            # De-duplicated, order preserved.
+            self.assertEqual(written["permissions"]["allow"], ["Shell(ls)"])
+            deny = written["permissions"]["deny"]
+            self.assertEqual(deny[:2], ["Shell(rm)", "Write(/etc/**)"])
+            self.assertIn("Write(**)", deny)
+            self.assertIn("Shell(*)", deny)
+            self.assertIn(f"Write({os.path.realpath(cfg_dir)}/**)", deny)
+
+    def test_malformed_operator_permissions_fail_closed(self) -> None:
+        """An ambiguous authority boundary must refuse, not silently drop entries."""
+        for payload in (
+            {"permissions": {"deny": "Shell(*)"}},
+            {"permissions": {"deny": [["Shell(*)"]]}},
+            {"permissions": {"allow": [{"rule": "Shell(*)"}]}},
+            {"permissions": {"deny": [""]}},
+            {"permissions": {"deny": ["  "]}},
+            {"permissions": {"allow": [1]}},
+            {"permissions": {"deny": [None]}},
+            {"permissions": {"allow": [True]}},
+            {"permissions": []},
+            ["not", "an", "object"],
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp) / "home"
+                home.mkdir()
+                self._operator_config(home, payload)
+                with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                    for var in ("CURSOR_CONFIG_DIR", "XDG_CONFIG_HOME"):
+                        os.environ.pop(var, None)
+                    with self.assertRaises(M.UsageError, msg=repr(payload)):
+                        M.write_role_cursor_config(
+                            Path(tmp) / "role", allow_edit=False, allow_shell=False
+                        )
+
+    def test_operator_config_is_resolved_the_way_the_cli_resolves_it(self) -> None:
+        """A whitespace-only CURSOR_CONFIG_DIR must fall through, as the CLI does.
+
+        Reading the wrong file drops the operator's denies from every worker, so the
+        resolution order has to match the CLI's trim-then-test behaviour exactly.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            xdg = Path(tmp) / "xdg"
+            explicit = Path(tmp) / "explicit"
+            for path in (home, xdg, explicit):
+                path.mkdir()
+            with mock.patch.dict(
+                os.environ,
+                {"HOME": str(home), "CURSOR_CONFIG_DIR": "   ", "XDG_CONFIG_HOME": str(xdg)},
+                clear=False,
+            ):
+                self.assertEqual(
+                    M.operator_cursor_config_path(), xdg / "cursor" / "cli-config.json"
+                )
+            with mock.patch.dict(
+                os.environ,
+                {"HOME": str(home), "CURSOR_CONFIG_DIR": str(explicit)},
+                clear=False,
+            ):
+                self.assertEqual(
+                    M.operator_cursor_config_path(), explicit / "cli-config.json"
+                )
+            with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                for var in ("CURSOR_CONFIG_DIR", "XDG_CONFIG_HOME"):
+                    os.environ.pop(var, None)
+                self.assertEqual(
+                    M.operator_cursor_config_path(), home / ".cursor" / "cli-config.json"
+                )
+
+    def test_repository_mcp_manifest_refuses_read_only_roles(self) -> None:
+        """Cursor spawns repo MCP servers before permissions apply.
+
+        No generated deny reaches them and --disable-project-configs covers
+        .cursor/cli.json only, so a reader in such a repo is not read-only.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            reader = M.Role("reader", "Reader", "Investigate", "ask")
+            writer = M.Role("writer", "Writer", "Implement", "agent")
+            # No manifest: nothing to refuse.
+            M.validate_project_mcp_isolation(root, [reader], set(), False)
+            (root / ".cursor").mkdir()
+            (root / ".cursor" / "mcp.json").write_text('{"mcpServers":{}}')
+            with self.assertRaises(M.UsageError) as ctx:
+                M.validate_project_mcp_isolation(root, [reader, writer], {"writer"}, False)
+            self.assertIn("reader", str(ctx.exception))
+            self.assertNotIn("writer:", str(ctx.exception))
+            # An explicit opt-in is honoured, and a writer-only fleet is unaffected.
+            M.validate_project_mcp_isolation(root, [reader], set(), True)
+            M.validate_project_mcp_isolation(root, [writer], {"writer"}, False)
 
     def test_agent_mode_is_never_passed_as_a_mode_value(self) -> None:
         writer = M.Role("writer", "Writer", "Implement", "agent")
@@ -274,22 +474,20 @@ class CursorCultUnitTests(unittest.TestCase):
         # when the --help probe times out, raises, or returns nothing, while every
         # other capability defaults permissive — so failing open would launch a
         # read-only role with argv identical to an authorized writer.
-        no_mode = M.CursorCapabilities(
-            supports_mode=False,
-            supports_resume=True,
-            supports_model=True,
-            supports_force=True,
-            supports_trust=True,
-            supports_approve_mcps=True,
-        )
+        no_mode = dataclasses.replace(FULL_CAPS, supports_mode=False)
         reader = M.Role("reader", "Reader", "Investigate", "ask")
         planner = M.Role("planner", "Planner", "Plan", "plan")
         writer = M.Role("writer", "Writer", "Implement", "agent")
 
+        # `--approve-mcps` is now writer-only, so the two argvs are no longer literally
+        # identical — but nothing that grants authority distinguishes them. Compare the
+        # authority-bearing arguments: a reader still gets Cursor's default agent mode
+        # carrying --force, which is exactly the writer's authority.
+        authority = lambda args: [a for a in args if a != "--approve-mcps"]  # noqa: E731
         self.assertEqual(
-            M.build_cursor_args("cursor-agent", reader, "p", None, False, no_mode),
-            M.build_cursor_args("cursor-agent", writer, "p", None, True, no_mode),
-            "without --mode a read-only role is argv-identical to an authorized writer",
+            authority(M.build_cursor_args("cursor-agent", reader, "p", None, False, no_mode)),
+            authority(M.build_cursor_args("cursor-agent", writer, "p", None, True, no_mode)),
+            "without --mode a read-only role carries an authorized writer's authority",
         )
         for roles in ([reader], [planner], [reader, writer]):
             with self.assertRaises(M.UsageError) as caught:
@@ -826,6 +1024,45 @@ class CursorCultUnitTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(check.returncode, 0, check.stderr)
+
+
+@unittest.skipUnless(
+    shutil.which("cursor-agent"), "requires a real, authenticated Cursor CLI"
+)
+class RealCursorCliTests(unittest.TestCase):
+    """The class of test the fake cannot provide.
+
+    A previous attempt at this hardening shipped a capability probe that searched
+    `cursor-agent --help` for `--disable-project-configs`. Cursor registers that option
+    with Commander's `.hideHelp()`, so the probe was always false and every entry point
+    refused to launch — yet the whole suite passed, because the fake had been taught to
+    print the flag in its help. Only an assertion against the installed binary can
+    catch that, so this runs the real thing and is skipped when it is absent.
+    """
+
+    def test_capability_probe_matches_the_installed_binary(self) -> None:
+        cli = shutil.which("cursor-agent")
+        env = M.sanitized_cursor_env()
+        help_text = subprocess.run(
+            [cli, "--help"], capture_output=True, text=True, check=False, timeout=60
+        ).stdout
+        accepted = M.probe_flag_accepted(cli, env, "--disable-project-configs")
+        self.assertTrue(
+            accepted,
+            "the installed Cursor CLI rejected --disable-project-configs; cursor-cult "
+            "will refuse to launch until it is upgraded",
+        )
+        self.assertFalse(
+            M.probe_flag_accepted(cli, env, "--cursor-cult-not-a-real-flag"),
+            "probe reported a nonexistent flag as supported — it fails open",
+        )
+        if "--disable-project-configs" not in help_text:
+            # The expected state today. Asserted explicitly so that a help-text probe
+            # can never be reintroduced without this test objecting.
+            self.assertTrue(
+                accepted,
+                "flag is hidden from --help yet accepted: never probe help text",
+            )
 
 
 class CursorCultIntegrationTests(unittest.TestCase):
