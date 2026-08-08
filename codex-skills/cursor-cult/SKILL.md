@@ -78,6 +78,10 @@ Select the mode per role from the user's current intent, authority, live evidenc
 
 Cursor accepts only `ask` and `plan` as explicit `--mode` values, so the runner selects agent mode by omitting `--mode`. `agent` is rejected unless that same role is passed as `--writer`. The runner treats role IDs as opaque host-created identities; it contains no catalog.
 
+Mode and tool access are separate decisions. Cursor's native web/search tools do not require shell. When a read-only role must run `git`, `curl`, `gh`, a package manager, tests, or another terminal command, isolate that role in its own fleet invocation and add `--readonly-shell` to both `check` and the matching `run` or `start`. Do not enable it for a mixed fleet merely because one role wants the network: the flag removes Cursor Cult's explicit `Shell(*)` deny for every `ask`/`plan` role in that invocation, and shell remains a write vector even when the role is described as read-only. If the task actually authorizes local mutation, use one `agent` writer plus `--writer` instead of weakening a reader.
+
+`--readonly-shell` removes only Cursor Cult's own shell deny. It does not disable Cursor's OS sandbox, change Cursor's network-access mode, bypass an enterprise allow/deny policy, or guarantee egress. Cursor Cult's detached `start` is a local process supervisor that ultimately executes the same headless `cursor-agent -p` path as foreground `run`; it is not `cursor-agent --background` and not Cursor's remote Background Agents product. An authorized agent writer already receives the runner's strongest documented local CLI path (`--force`, with agent mode selected by omitting `--mode`); `--yolo` is not a separate escape hatch, and neither flag overrides an explicit deny.
+
 ## 4. Preserve workspace safety
 
 In one worktree, authorize at most one writer in a fleet invocation. Other workers remain read-only. Multiple writers require separate worktrees and separate fleet invocations with explicit ownership boundaries.
@@ -92,6 +96,8 @@ Resolve `SKILL_ROOT` as the directory containing this `SKILL.md`. Create one pri
 RUN="$(mktemp -d "${TMPDIR:-/tmp}/cursor-cult.XXXXXX")"
 chmod 700 "$RUN"
 ```
+
+When an isolated read-only invocation explicitly needs terminal commands, append `--readonly-shell` to the `check` command and to the matching `run` or `start` command. Otherwise omit it. Never add it only to preflight or only to execution, because that validates and runs different permission profiles.
 
 Write the synthesized files, then preflight:
 
